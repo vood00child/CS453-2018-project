@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <thread>
@@ -43,7 +45,7 @@ extern "C" {
 }
 
 // Internal headers
-namespace TM {
+namespace STM {
 extern "C" {
 #include <tm.h>
 }
@@ -77,6 +79,11 @@ extern "C" {
 
 // -------------------------------------------------------------------------- //
 
+// Whether to enable more safety checks
+constexpr static auto assert_mode = false;
+
+// -------------------------------------------------------------------------- //
+
 namespace Exception {
 
 /** Defines a simple exception.
@@ -104,9 +111,17 @@ EXCEPTION(Any, ::std::exception, "exception");
         EXCEPTION(ModuleLoading, Module, "unable to load a transaction library");
         EXCEPTION(ModuleSymbol, Module, "symbol not found in loaded libraries");
     EXCEPTION(Transaction, Any, "transaction manager exception");
-        EXCEPTION(TransactionCreate, Module, "shared memory region creation failed");
-        EXCEPTION(TransactionBegin, Module, "transaction begin failed");
-        EXCEPTION(TransactionAlloc, Module, "memory allocation failed (insufficient memory)");
+        EXCEPTION(TransactionAlign, Transaction, "incorrect alignment detected before transactional operation");
+        EXCEPTION(TransactionCreate, Transaction, "shared memory region creation failed");
+        EXCEPTION(TransactionBegin, Transaction, "transaction begin failed");
+        EXCEPTION(TransactionAlloc, Transaction, "memory allocation failed (insufficient memory)");
+        EXCEPTION(TransactionRetry, Transaction, "transaction aborted and can be retried");
+        EXCEPTION(TransactionNotLastSegment, Transaction, "trying to deallocate the first segment");
+    EXCEPTION(Shared, Any, "operation in shared memory exception");
+        EXCEPTION(SharedAlign, Shared, "address in shared memory is not properly aligned for the specified type");
+        EXCEPTION(SharedOverflow, Shared, "index is past array length");
+        EXCEPTION(SharedDoubleAlloc, Shared, "(probable) double allocation detected before transactional operation");
+        EXCEPTION(SharedDoubleFree, Shared, "double free detected before transactional operation");
     EXCEPTION(TooSlow, Any, "non-reference module takes too long to process the transactions");
 
 #undef EXCEPTION
@@ -115,24 +130,40 @@ EXCEPTION(Any, ::std::exception, "exception");
 
 // -------------------------------------------------------------------------- //
 
-/** Transactional library class.
+/** Non-copyable helper base class.
 **/
-class TransactionalLibrary final {
+class NonCopyable {
+public:
+    /** Deleted copy constructor/assignment.
+    **/
+    NonCopyable(NonCopyable const&) = delete;
+    NonCopyable& operator=(NonCopyable const&) = delete;
+protected:
+    /** Protected default constructor, to make sure class is not directly instantiated.
+    **/
+    NonCopyable() = default;
+};
+
+// -------------------------------------------------------------------------- //
+
+/** Transactional library management class.
+**/
+class TransactionalLibrary final: private NonCopyable {
     friend class TransactionalMemory;
 private:
     /** Function types.
     **/
-    using FnCreate  = decltype(&TM::tm_create);
-    using FnDestroy = decltype(&TM::tm_destroy);
-    using FnStart   = decltype(&TM::tm_start);
-    using FnSize    = decltype(&TM::tm_size);
-    using FnAlign   = decltype(&TM::tm_align);
-    using FnBegin   = decltype(&TM::tm_begin);
-    using FnEnd     = decltype(&TM::tm_end);
-    using FnRead    = decltype(&TM::tm_read);
-    using FnWrite   = decltype(&TM::tm_write);
-    using FnAlloc   = decltype(&TM::tm_alloc);
-    using FnFree    = decltype(&TM::tm_free);
+    using FnCreate  = decltype(&STM::tm_create);
+    using FnDestroy = decltype(&STM::tm_destroy);
+    using FnStart   = decltype(&STM::tm_start);
+    using FnSize    = decltype(&STM::tm_size);
+    using FnAlign   = decltype(&STM::tm_align);
+    using FnBegin   = decltype(&STM::tm_begin);
+    using FnEnd     = decltype(&STM::tm_end);
+    using FnRead    = decltype(&STM::tm_read);
+    using FnWrite   = decltype(&STM::tm_write);
+    using FnAlloc   = decltype(&STM::tm_alloc);
+    using FnFree    = decltype(&STM::tm_free);
 private:
     void*     module;     // Module opaque handler
     FnCreate  tm_create;  // Module's initialization function
@@ -161,10 +192,6 @@ private:
         func = solve<Signature>(name);
     }
 public:
-    /** Deleted copy constructor/assignment.
-    **/
-    TransactionalLibrary(TransactionalLibrary const&) = delete;
-    TransactionalLibrary& operator=(TransactionalLibrary const&) = delete;
     /** Loader constructor.
      * @param path  Path to the library to load
     **/
@@ -198,36 +225,42 @@ public:
     }
 };
 
-/** Transactional memory class.
+/** One shared memory region management class.
 **/
-class TransactionalMemory final {
+class TransactionalMemory final: private NonCopyable {
+private:
+    /** Check whether the given alignment is a power of 2
+    **/
+    constexpr static bool is_power_of_two(size_t align) noexcept {
+        return align != 0 && (align & (align - 1)) == 0;
+    }
 public:
     /** Opaque shared memory region handle class.
     **/
-    using Shared = TM::shared_t;
-    /** Transaction class.
+    using Shared = STM::shared_t;
+    /** Transaction class alias.
     **/
-    using TX = TM::tx_t;
+    using TX = STM::tx_t;
 private:
     TransactionalLibrary const& tl; // Bound transactional library
-    Shared    shared;     // Handle of the shared memory region used
-    uintptr_t start_addr; // Shared memory region start address
+    Shared shared;     // Handle of the shared memory region used
+    void*  start_addr; // Shared memory region first segment's start address
+    size_t start_size; // Shared memory region first segment's size (in bytes)
+    size_t alignment;  // Shared memory region alignment (in bytes)
 public:
-    /** Deleted copy constructor/assignment.
-    **/
-    TransactionalMemory(TransactionalMemory const&) = delete;
-    TransactionalMemory& operator=(TransactionalMemory const&) = delete;
     /** Bind constructor.
      * @param library Transactional library to use
      * @param align   Shared memory region required alignment
      * @param size    Size of the shared memory region to allocate
     **/
-    TransactionalMemory(TransactionalLibrary const& library, size_t align, size_t size): tl{library} {
+    TransactionalMemory(TransactionalLibrary const& library, size_t align, size_t size): tl{library}, start_size{size}, alignment{align} {
+        if (unlikely(assert_mode && (!is_power_of_two(align) || size % align != 0)))
+            throw Exception::TransactionAlign{};
         { // Initialize shared memory region
             shared = tl.tm_create(size, align);
-            if (unlikely(shared == TM::invalid_shared))
+            if (unlikely(shared == STM::invalid_shared))
                 throw Exception::TransactionCreate{};
-            start_addr = reinterpret_cast<uintptr_t>(tl.tm_start(shared));
+            start_addr = tl.tm_start(shared);
         }
     }
     /** Unbind destructor.
@@ -236,28 +269,36 @@ public:
         tl.tm_destroy(shared);
     }
 public:
-    /** Build an address in the shared region from an offset.
-     * @param ptr Offset (in bytes)
-     * @return Address in the shared region
+    /** [thread-safe] Return the start address of the first shared segment.
+     * @return Address of the first allocated shared region
     **/
-    void* address(uintptr_t ptr) const noexcept {
-        return reinterpret_cast<void*>(ptr + start_addr);
+    auto get_start() const noexcept {
+        return start_addr;
+    }
+    /** [thread-safe] Return the size of the first shared segment.
+     * @return Size in the first allocated shared region (in bytes)
+    **/
+    auto get_size() const noexcept {
+        return start_size;
+    }
+    /** [thread-safe] Get the shared memory region global alignment.
+     * @return Global alignment (in bytes)
+    **/
+    auto get_align() const noexcept {
+        return alignment;
     }
 public:
     /** [thread-safe] Begin a new transaction on the shared memory region.
-     * @return Opaque transaction ID
+     * @return Opaque transaction ID, 'STM::invalid_tx' on failure
     **/
-    auto begin() {
-        auto&& res = tl.tm_begin(shared);
-        if (unlikely(res == TM::invalid_tx))
-            throw Exception::TransactionBegin{};
-        return res;
+    auto begin() const noexcept {
+        return tl.tm_begin(shared);
     }
     /** [thread-safe] End the given transaction.
      * @param tx Opaque transaction ID
      * @return Whether the whole transaction is a success
     **/
-    auto end(TX tx) noexcept {
+    auto end(TX tx) const noexcept {
         return tl.tm_end(shared, tx);
     }
     /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -267,7 +308,7 @@ public:
      * @param target Target start address
      * @return Whether the whole transaction can continue
     **/
-    auto read(TX tx, void const* source, size_t size, void* target) noexcept {
+    auto read(TX tx, void const* source, size_t size, void* target) const noexcept {
         return tl.tm_read(shared, tx, source, size, target);
     }
     /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -277,28 +318,338 @@ public:
      * @param target Target start address
      * @return Whether the whole transaction can continue
     **/
-    auto write(TX tx, void const* source, size_t size, void* target) noexcept {
+    auto write(TX tx, void const* source, size_t size, void* target) const noexcept {
         return tl.tm_write(shared, tx, source, size, target);
     }
     /** [thread-safe] Memory allocation operation in the given transaction, throw if no memory available.
      * @param tx     Transaction to use
      * @param size   Size to allocate
      * @param target Target start address
-     * @return Whether the whole transaction can continue
+     * @return Allocation status
     **/
-    auto alloc(TX tx, size_t size, void** target) {
-        auto status = tl.tm_alloc(shared, tx, size, target);
-        if (unlikely(status == TM::nomem_alloc))
-            throw Exception::TransactionAlloc{};
-        return status == TM::success_alloc;
+    auto alloc(TX tx, size_t size, void** target) const noexcept {
+        return tl.tm_alloc(shared, tx, size, target);
     }
     /** [thread-safe] Memory freeing operation in the given transaction.
      * @param tx     Transaction to use
      * @param target Target start address
      * @return Whether the whole transaction can continue
     **/
-    auto free(TX tx, void* target) noexcept {
+    auto free(TX tx, void* target) const noexcept {
         return tl.tm_free(shared, tx, target);
+    }
+};
+
+/** One transaction over a shared memory region management class.
+**/
+class Transaction final: private NonCopyable {
+private:
+    TransactionalMemory const& tm; // Bound transactional memory
+    STM::tx_t tx; // Opaque transaction handle
+    bool aborted; // Transaction was aborted
+public:
+    /** Deleted copy constructor/assignment.
+    **/
+    Transaction(Transaction const&) = delete;
+    Transaction& operator=(Transaction const&) = delete;
+    /** Begin constructor.
+     * @param tm Transactional memory to bind
+    **/
+    Transaction(TransactionalMemory const& tm): tm{tm}, tx{tm.begin()}, aborted{false} {
+        if (unlikely(tx == STM::invalid_tx))
+            throw Exception::TransactionBegin{};
+    }
+    /** End destructor.
+    **/
+    ~Transaction() {
+        if (likely(!aborted))
+            tm.end(tx);
+    }
+public:
+    /** [thread-safe] Return the bound transactional memory instance.
+     * @return Bound transactional memory instance
+    **/
+    auto const& get_tm() const noexcept {
+        return tm;
+    }
+public:
+    /** [thread-safe] Read operation in the bound transaction, source in the shared region and target in a private region.
+     * @param source Source start address
+     * @param size   Source/target range
+     * @param target Target start address
+    **/
+    void read(void const* source, size_t size, void* target) const {
+        if (unlikely(!tm.read(tx, source, size, target)))
+            throw Exception::TransactionRetry{};
+    }
+    /** [thread-safe] Write operation in the bound transaction, source in a private region and target in the shared region.
+     * @param source Source start address
+     * @param size   Source/target range
+     * @param target Target start address
+    **/
+    void write(void const* source, size_t size, void* target) const {
+        if (unlikely(!tm.write(tx, source, size, target)))
+            throw Exception::TransactionRetry{};
+    }
+    /** [thread-safe] Memory allocation operation in the bound transaction, throw if no memory available.
+     * @param size Size to allocate
+     * @return Target start address
+    **/
+    void* alloc(size_t size) const {
+        void* target;
+        auto status = tm.alloc(tx, size, &target);
+        if (unlikely(status == STM::nomem_alloc))
+            throw Exception::TransactionAlloc{};
+        if (unlikely(status != STM::success_alloc))
+            throw Exception::TransactionRetry{};
+        return target;
+    }
+    /** [thread-safe] Memory freeing operation in the bound transaction.
+     * @param target Target start address
+    **/
+    void free(void* target) const {
+        if (unlikely(!tm.free(tx, target)))
+            throw Exception::TransactionRetry{};
+    }
+};
+
+/** Shared read/write helper class.
+ * @param Type Specified type (array)
+**/
+template<class Type> class Shared {
+protected:
+    Transaction const& tx; // Bound transaction
+    Type* address; // Address in shared memory
+public:
+    /** Binding constructor.
+     * @param tx      Bound transaction
+     * @param address Address to bind to
+    **/
+    Shared(Transaction const& tx, void* address): tx{tx}, address{reinterpret_cast<Type*>(address)} {
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % tx.get_tm().get_align() != 0))
+            throw Exception::SharedAlign{};
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % alignof(Type) != 0))
+            throw Exception::SharedAlign{};
+    }
+public:
+    /** Get the address in shared memory.
+     * @return Address in shared memory
+    **/
+    auto get() const noexcept {
+        return address;
+    }
+public:
+    /** Read operation.
+     * @return Private copy of the content at the shared address
+    **/
+    Type read() const {
+        Type res;
+        tx.read(address, sizeof(Type), &res);
+        return res;
+    }
+    operator Type() const {
+        return read();
+    }
+    /** Write operation.
+     * @param source Private content to write at the shared address
+    **/
+    void write(Type const& source) const {
+        tx.write(&source, sizeof(Type), address);
+    }
+    void operator=(Type const& source) const {
+        return write(source);
+    }
+public:
+    /** Address of the first byte after the entry.
+     * @return First byte after the entry
+    **/
+    void* after() const noexcept {
+        return address + 1;
+    }
+};
+template<class Type> class Shared<Type*> {
+protected:
+    Transaction const& tx; // Bound transaction
+    Type** address; // Address in shared memory
+public:
+    /** Binding constructor.
+     * @param tx      Bound transaction
+     * @param address Address to bind to
+    **/
+    Shared(Transaction const& tx, void* address): tx{tx}, address{reinterpret_cast<Type**>(address)} {
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % tx.get_tm().get_align() != 0))
+            throw Exception::SharedAlign{};
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % alignof(Type*) != 0))
+            throw Exception::SharedAlign{};
+    }
+public:
+    /** Get the address in shared memory.
+     * @return Address in shared memory
+    **/
+    auto get() const noexcept {
+        return address;
+    }
+public:
+    /** Read operation.
+     * @return Private copy of the content at the shared address
+    **/
+    Type* read() const {
+        Type* res;
+        tx.read(address, sizeof(Type*), &res);
+        return res;
+    }
+    operator Type*() const {
+        return read();
+    }
+    /** Write operation.
+     * @param source Private content to write at the shared address
+    **/
+    void write(Type* source) const {
+        tx.write(&source, sizeof(Type*), address);
+    }
+    void operator=(Type* source) const {
+        return write(source);
+    }
+    /** Allocate and write operation.
+     * @param size Size to allocate (defaults to size of the underlying class)
+     * @return Private copy of the just-written content at the shared address
+    **/
+    Type* alloc(size_t size = 0) const {
+        if (unlikely(assert_mode && read() != nullptr))
+            throw Exception::SharedDoubleAlloc{};
+        auto addr = tx.alloc(size > 0 ? size: sizeof(Type));
+        write(reinterpret_cast<Type*>(addr));
+        return reinterpret_cast<Type*>(addr);
+    }
+    /** Free and write operation.
+    **/
+    void free() const {
+        if (unlikely(assert_mode && read() == nullptr))
+            throw Exception::SharedDoubleFree{};
+        tx.free(read());
+        write(nullptr);
+    }
+public:
+    /** Address of the first byte after the entry.
+     * @return First byte after the entry
+    **/
+    void* after() const noexcept {
+        return address + 1;
+    }
+};
+template<class Type> class Shared<Type[]> {
+protected:
+    Transaction const& tx; // Bound transaction
+    Type* address; // Address of the first element in shared memory
+public:
+    /** Binding constructor.
+     * @param tx      Bound transaction
+     * @param address Address to bind to
+    **/
+    Shared(Transaction const& tx, void* address): tx{tx}, address{reinterpret_cast<Type*>(address)} {
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % tx.get_tm().get_align() != 0))
+            throw Exception::SharedAlign{};
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % alignof(Type) != 0))
+            throw Exception::SharedAlign{};
+    }
+public:
+    /** Get the address in shared memory.
+     * @return Address in shared memory
+    **/
+    auto get() const noexcept {
+        return address;
+    }
+public:
+    /** Read operation.
+     * @param index Index to read
+     * @return Private copy of the content at the shared address
+    **/
+    Type read(size_t index) const {
+        Type res;
+        tx.read(address + index, sizeof(Type), &res);
+        return res;
+    }
+    /** Write operation.
+     * @param index  Index to write
+     * @param source Private content to write at the shared address
+    **/
+    void write(size_t index, Type const& source) const {
+        tx.write(tx, &source, sizeof(Type), address + index);
+    }
+public:
+    /** Reference a cell.
+     * @param index Cell to reference
+     * @return Shared on that cell
+    **/
+    Shared<Type> operator[](size_t index) const {
+        return Shared<Type>{tx, address + index};
+    }
+    /** Address of the first byte after the entry.
+     * @param length Length of the array
+     * @return First byte after the entry
+    **/
+    void* after(size_t length) const noexcept {
+        return address + length;
+    }
+};
+template<class Type, size_t n> class Shared<Type[n]> {
+protected:
+    Transaction const& tx; // Bound transaction
+    Type* address; // Address of the first element in shared memory
+public:
+    /** Binding constructor.
+     * @param tx      Bound transaction
+     * @param address Address to bind to
+    **/
+    Shared(Transaction const& tx, void* address): tx{tx}, address{reinterpret_cast<Type*>(address)} {
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % tx.get_tm().get_align() != 0))
+            throw Exception::SharedAlign{};
+        if (unlikely(assert_mode && reinterpret_cast<uintptr_t>(address) % alignof(Type) != 0))
+            throw Exception::SharedAlign{};
+    }
+public:
+    /** Get the address in shared memory.
+     * @return Address in shared memory
+    **/
+    auto get() const noexcept {
+        return address;
+    }
+public:
+    /** Read operation.
+     * @param index Index to read
+     * @return Private copy of the content at the shared address
+    **/
+    Type read(size_t index) const {
+        if (unlikely(assert_mode && index >= n))
+            throw Exception::SharedOverflow{};
+        Type res;
+        tx.read(address + index, sizeof(Type), &res);
+        return res;
+    }
+    /** Write operation.
+     * @param index  Index to write
+     * @param source Private content to write at the shared address
+    **/
+    void write(size_t index, Type const& source) const {
+        if (unlikely(assert_mode && index >= n))
+            throw Exception::SharedOverflow{};
+        tx.write(tx, &source, sizeof(Type), address + index);
+    }
+public:
+    /** Reference a cell.
+     * @param index Cell to reference
+     * @return Shared on that cell
+    **/
+    Shared<Type> operator[](size_t index) const {
+        if (unlikely(assert_mode && index >= n))
+            throw Exception::SharedOverflow{};
+        return Shared<Type>{tx, address + index};
+    }
+    /** Address of the first byte after the array.
+     * @return First byte after the array
+    **/
+    void* after() const noexcept {
+        return address + n;
     }
 };
 
@@ -308,7 +659,285 @@ public:
 **/
 using Seed = ::std::uint_fast32_t;
 
-/** High-performance time accounting class.
+/** Workload base class.
+**/
+class Workload {
+protected:
+    TransactionalLibrary const& tl;  // Associated transactional library
+    TransactionalMemory         tm;  // Built transactional memory to use
+public:
+    /** Deleted copy constructor/assignment.
+    **/
+    Workload(Workload const&) = delete;
+    Workload& operator=(Workload const&) = delete;
+    /** Transactional memory constructor.
+     * @param library Transactional library to use
+     * @param align   Shared memory region required alignment
+     * @param size    Size of the shared memory region to allocate
+    **/
+    Workload(TransactionalLibrary const& library, size_t align, size_t size): tl{library}, tm{tl, align, size} {}
+    /** Virtual destructor.
+    **/
+    virtual ~Workload() {};
+public:
+    /** [thread-safe] Worker full run.
+     * @param seed Seed to use
+     * @return Whether no inconsistency has been (passively) detected
+    **/
+    virtual bool run(Seed) const = 0;
+    /** [thread-safe] Worker full run.
+     * @return Whether no inconsistency has been detected
+    **/
+    virtual bool check() const = 0;
+};
+
+/** Bank workload class.
+**/
+class Bank final: public Workload {
+public:
+    /** Account balance class alias.
+    **/
+    using Balance = intptr_t;
+    static_assert(sizeof(Balance) >= sizeof(void*), "Balance class is too small");
+private:
+    /** Shared segment of accounts class.
+    **/
+    class AccountSegment final {
+    private:
+        /** Dummy structure for size and alignment retrieval.
+        **/
+        struct Dummy {
+            size_t  dummy0;
+            void*   dummy1;
+            Balance dummy2;
+            Balance dummy3[];
+        };
+    public:
+        /** Get the segment size for a given number of accounts.
+         * @param nbaccounts Number of accounts per segment
+         * @return Segment size (in bytes)
+        **/
+        constexpr static auto size(size_t nbaccounts) noexcept {
+            return sizeof(Dummy) + nbaccounts * sizeof(Balance);
+        }
+        /** Get the segment alignment for a given number of accounts.
+         * @return Segment size (in bytes)
+        **/
+        constexpr static auto align() noexcept {
+            return alignof(Dummy);
+        }
+    public:
+        Shared<size_t>         count; // Number of allocated accounts in this segment
+        Shared<AccountSegment*> next; // Next allocated segment
+        Shared<Balance>       parity; // Segment balance correction for when deleting an account
+        Shared<Balance[]>   accounts; // Amount of money on the accounts (undefined if not allocated)
+    public:
+        /** Deleted copy constructor/assignment.
+        **/
+        AccountSegment(AccountSegment const&) = delete;
+        AccountSegment& operator=(AccountSegment const&) = delete;
+        /** Binding constructor.
+         * @param tx      Associated pending transaction
+         * @param address Block base address
+        **/
+        AccountSegment(Transaction const& tx, void* address): count{tx, address}, next{tx, count.after()}, parity{tx, next.after()}, accounts{tx, parity.after()} {}
+    };
+private:
+    size_t  nbtxperwrk;    // Number of transactions per worker
+    size_t  nbaccounts;    // Initial number of accounts and number of accounts per segment
+    size_t  expnbaccounts; // Expected total number of accounts
+    Balance init_balance;  // Initial account balance
+    float   prob_long;     // Probability of running a long, read-only control transaction
+    float   prob_alloc;    // Probability of running an allocation/deallocation transaction, knowing a long transaction won't run
+public:
+    /** Bank workload constructor.
+     * @param library       Transactional library to use
+     * @param nbtxperwrk    Number of transactions per worker
+     * @param nbaccounts    Initial number of accounts and number of accounts per segment
+     * @param expnbaccounts Initial number of accounts and number of accounts per segment
+     * @param init_balance  Initial account balance
+     * @param prob_long     Probability of running a long, read-only control transaction
+     * @param prob_alloc    Probability of running an allocation/deallocation transaction, knowing a long transaction won't run
+    **/
+    Bank(TransactionalLibrary const& library, size_t nbtxperwrk, size_t nbaccounts, size_t expnbaccounts, Balance init_balance, float prob_long, float prob_alloc): Workload{library, AccountSegment::align(), AccountSegment::size(nbaccounts)}, nbtxperwrk{nbtxperwrk}, nbaccounts{nbaccounts}, expnbaccounts{expnbaccounts}, init_balance{init_balance}, prob_long{prob_long}, prob_alloc{prob_alloc} {
+        do {
+            try {
+                Transaction tx{tm};
+                AccountSegment segment{tx, tm.get_start()};
+                segment.count = nbaccounts;
+                for (size_t i = 0; i < nbaccounts; ++i)
+                    segment.accounts[i] = init_balance;
+                break;
+            } catch (Exception::TransactionRetry const&) {
+                continue;
+            }
+        } while (true);
+    }
+private:
+    /** Long read-only transaction, summing the balance of each account.
+     * @param count Loosely-updated number of accounts
+     * @return Whether no inconsistency has been found
+    **/
+    bool long_tx(size_t& nbaccounts) const {
+        do {
+            try {
+                auto count = 0ul;
+                auto sum   = Balance{0};
+                auto start = tm.get_start();
+                Transaction tx{tm};
+                while (start) {
+                    AccountSegment segment{tx, start};
+                    decltype(count) segment_count = segment.count;
+                    count += segment_count;
+                    sum += segment.parity;
+                    for (decltype(count) i = 0; i < segment_count; ++i) {
+                        Balance local = segment.accounts[i];
+                        if (unlikely(local < 0))
+                            return false;
+                        sum += local;
+                    }
+                    start = segment.next;
+                }
+                nbaccounts = count;
+                return sum == static_cast<Balance>(init_balance * count);
+            } catch (Exception::TransactionRetry const&) {
+                continue;
+            }
+        } while (true);
+    }
+    /** Account (de)allocation transaction, adding accounts with initial balance or removing them.
+     * @param trigger Trigger level that will decide whether to allocate or deallocate
+     * @return Whether no inconsistency has been found
+    **/
+    bool alloc_tx(size_t trigger) const {
+        do {
+            try {
+                auto count = 0ul;
+                auto start = tm.get_start();
+                void* prev = nullptr;
+                Transaction tx{tm};
+                while (true) {
+                    AccountSegment segment{tx, start};
+                    decltype(count) segment_count = segment.count;
+                    count += segment_count;
+                    decltype(start) segment_next = segment.next;
+                    if (!segment_next) {
+                        if (count > trigger && likely(count > 2)) { // Deallocate
+                            --segment_count;
+                            auto new_parity = segment.parity.read() + segment.accounts[segment_count] - init_balance;
+                            if (segment_count > 0) { // Just "deallocate" account
+                                segment.count = segment_count;
+                                segment.parity = new_parity;
+                            } else { // Deallocate segment
+                                if (unlikely(assert_mode && prev == nullptr))
+                                    throw Exception::TransactionNotLastSegment{};
+                                AccountSegment prev_segment{tx, prev};
+                                prev_segment.next.free();
+                                prev_segment.parity = prev_segment.parity.read() + new_parity;
+                            }
+                        } else { // Allocate
+                            if (segment_count < nbaccounts) { // Just "allocate" account
+                                segment.accounts[segment_count] = init_balance;
+                                segment.count = segment_count + 1;
+                            } else {
+                                AccountSegment next_segment{tx, segment.next.alloc(AccountSegment::size(nbaccounts))};
+                                next_segment.count = 1;
+                                next_segment.accounts[0] = init_balance;
+                            }
+                        }
+                        return true;
+                    }
+                    prev  = start;
+                    start = segment_next;
+                }
+            } catch (Exception::TransactionRetry const&) {
+                continue;
+            }
+        } while (true);
+    }
+    /** Short read-write transaction, transferring one unit from an account to an account (potentially the same).
+     * @param send_id Index of the sender account
+     * @param recv_id Index of the receiver account (potentially same as source)
+     * @return Whether no inconsistency has been found
+    **/
+    bool short_tx(size_t send_id, size_t recv_id) const {
+        do {
+            try {
+                auto start = tm.get_start();
+                Transaction tx{tm};
+                void* send_ptr = nullptr;
+                void* recv_ptr = nullptr;
+                // Get the account pointers in shared memory
+                while (true) {
+                    AccountSegment segment{tx, start};
+                    size_t segment_count = segment.count;
+                    if (!send_ptr) {
+                        if (send_id < segment_count) {
+                            send_ptr = segment.accounts[send_id].get();
+                            if (recv_ptr)
+                                break;
+                        } else {
+                            send_id -= segment_count;
+                        }
+                    }
+                    if (!recv_ptr) {
+                        if (recv_id < segment_count) {
+                            recv_ptr = segment.accounts[recv_id].get();
+                            if (send_ptr)
+                                break;
+                        } else {
+                            recv_id -= segment_count;
+                        }
+                    }
+                    start = segment.next;
+                    if (!start) // Current segment is the last segment
+                        return true; // At least one account does not exist => do nothing
+                }
+                // Transfer the money if enough fund
+                Shared<Balance> sender{tx, send_ptr};
+                Shared<Balance> recver{tx, recv_ptr};
+                auto send_val = sender.read();
+                if (send_val > 0) {
+                    sender = send_val - 1;
+                    recver = recver.read() + 1;
+                }
+                return true;
+            } catch (Exception::TransactionRetry const&) {
+                continue;
+            }
+        } while (true);
+    }
+public:
+    virtual bool run(Seed seed) const {
+        ::std::minstd_rand engine{seed};
+        ::std::bernoulli_distribution long_dist{prob_long};
+        ::std::bernoulli_distribution alloc_dist{prob_alloc};
+        ::std::gamma_distribution<float> alloc_trigger(expnbaccounts, 1);
+        size_t count = nbaccounts;
+        for (size_t cntr = 0; cntr < nbtxperwrk; ++cntr) {
+            if (long_dist(engine)) { // Do a long transaction
+                if (unlikely(!long_tx(count)))
+                    return false;
+            } else if (alloc_dist(engine)) { // Do an allocation transaction
+                if (unlikely(!alloc_tx(alloc_trigger(engine))))
+                    return false;
+            } else { // Do a short transaction
+                ::std::uniform_int_distribution<size_t> account{0, count - 1};
+                if (unlikely(!short_tx(account(engine), account(engine))))
+                    return false;
+            }
+        }
+        return true;
+    }
+    virtual bool check() const {
+        size_t dummy;
+        return long_tx(dummy);
+    }
+};
+
+// -------------------------------------------------------------------------- //
+
+/** Time accounting class.
 **/
 class Chrono final {
 public:
@@ -323,8 +952,7 @@ public:
     /** Tick constructor.
      * @param tick Initial number of ticks (optional)
     **/
-    Chrono(Tick tick = 0) noexcept: total{tick} {
-    }
+    Chrono(Tick tick = 0) noexcept: total{tick} {}
 private:
     /** Call a "clock" function, convert the result to the Tick type.
      * @param func "Clock" function to call
@@ -366,182 +994,7 @@ public:
     auto get_tick() const noexcept {
         return total;
     }
-    /** Get the total execution time.
-     * @return Total execution time (in ns)
-    **/
-    auto get_time() const noexcept {
-        return static_cast<double>(total) / static_cast<double>(convert(::clock_getres));
-    }
 };
-
-/** Workload base class.
-**/
-class Workload {
-protected:
-    TransactionalLibrary const& tl;  // Associated transactional library
-    TransactionalMemory         tm;  // Built transactional memory to use
-    ::std::atomic<Chrono::Tick> sum; // Sum of the tick over all the runs
-public:
-    /** Deleted copy constructor/assignment.
-    **/
-    Workload(Workload const&) = delete;
-    Workload& operator=(Workload const&) = delete;
-    /** Transaction library constructor.
-     * @param library Transactional library to use
-     * @param align   Shared memory region required alignment
-     * @param size    Size of the shared memory region to allocate
-    **/
-    Workload(TransactionalLibrary const& library, size_t align, size_t size): tl{library}, tm{tl, align, size}, sum{0} {
-    }
-    /** Virtual destructor.
-    **/
-    virtual ~Workload() {};
-protected:
-    /** [thread-safe] Take into account the given local chronometer.
-     * @param chrono Local worker chronometer to take into account
-    **/
-    void add_tick(Chrono& chrono) noexcept {
-        sum.fetch_add(chrono.get_tick(), ::std::memory_order_relaxed);
-        chrono.reset();
-    }
-public:
-    /** Return then reset the number of tick.
-     * @return Sum of the worker execution ticks
-    **/
-    auto get_tick() noexcept {
-        auto&& res = sum.load(::std::memory_order_relaxed);
-        sum.store(0, ::std::memory_order_relaxed);
-        return res;
-    }
-    /** Return then reset the number of tick as time.
-     * @return Sum of the worker execution times
-    **/
-    auto get_time() noexcept {
-        auto&& res = Chrono{sum.load(::std::memory_order_relaxed)}.get_time();
-        sum.store(0, ::std::memory_order_relaxed);
-        return res;
-    }
-public:
-    /** [thread-safe] Worker full run.
-     * @param seed Seed to use
-     * @return Whether no inconsistency has been (passively) detected
-    **/
-    virtual bool run(Seed) = 0;
-    /** [thread-safe] Worker full run.
-     * @return Whether no inconsistency has been detected
-    **/
-    virtual bool check() = 0;
-};
-
-/** Bank workload class.
-**/
-class Bank final: public Workload {
-private:
-    size_t nbaccounts; // Number of accounts
-    size_t nbtxperwrk; // Number of transactions per worker
-    int  init_balance; // Initial account balance
-    float   prob_long; // Probability of running a long, read-only control transaction
-public:
-    /** Bank workload constructor.
-     * @param library      Transactional library to use
-     * @param nbaccounts   Number of accounts
-     * @param nbtxperwrk   Number of transactions per worker
-     * @param init_balance Initial account balance
-     * @param prob_long    Probability of running a long, read-only control transaction
-    **/
-    Bank(TransactionalLibrary const& library, size_t nbaccounts, size_t nbtxperwrk, int init_balance, float prob_long): Workload{library, sizeof(int), sizeof(int) * nbaccounts}, nbaccounts{nbaccounts}, nbtxperwrk{nbtxperwrk}, init_balance{init_balance}, prob_long{prob_long} {
-        do {
-            auto tx = tm.begin();
-            auto&& init_fn = [&]() {
-                for (size_t i = 0; i < nbaccounts; ++i) {
-                    if (unlikely(!tm.write(tx, &init_balance, sizeof(int), tm.address(i * sizeof(int)))))
-                        return false;
-                }
-                return true;
-            };
-            if (unlikely(!init_fn()))
-                continue;
-            if (unlikely(!tm.end(tx)))
-                continue;
-            break;
-        } while (false);
-    }
-private:
-    /** Long transaction, summing the balance of each account.
-     * @return Whether no inconsistency has been found
-    **/
-    bool long_check_tx() {
-        do {
-            auto valid = true;
-            auto tx = tm.begin();
-            int sum = 0;
-            auto&& read_fn = [&]() {
-                for (size_t i = 0; i < nbaccounts; ++i) {
-                    int local;
-                    if (unlikely(!tm.read(tx, tm.address(i * sizeof(int)), sizeof(int), &local)))
-                        return false;
-                    if (unlikely(local < 0))
-                        valid = false;
-                    sum += local;
-                }
-                return true;
-            };
-            if (unlikely(!read_fn()))
-                continue;
-            if (unlikely(!tm.end(tx)))
-                continue;
-            return valid && sum == init_balance * static_cast<int>(nbaccounts);
-        } while (true);
-    }
-public:
-    virtual bool run(Seed seed) {
-        ::std::minstd_rand engine{seed};
-        ::std::bernoulli_distribution long_dist{prob_long};
-        ::std::uniform_int_distribution<size_t> account{0, nbaccounts - 1};
-        Chrono chrono;
-        chrono.start();
-        for (size_t cntr = 0; cntr < nbtxperwrk;) {
-            if (long_dist(engine)) { // Do a long transaction
-                if (unlikely(!long_check_tx()))
-                    return false;
-            } else { // Do a short transaction
-                auto tx = tm.begin();
-                auto acc_a = account(engine);
-                auto acc_b = account(engine); // Of course, might be same as 'acc_a'
-                int solde_a, solde_b;
-                if (unlikely(!tm.read(tx, tm.address(acc_a * sizeof(int)), sizeof(int), &solde_a)))
-                    continue;
-                if (unlikely(!tm.read(tx, tm.address(acc_b * sizeof(int)), sizeof(int), &solde_b)))
-                    continue;
-                if (unlikely(solde_a < 0 || solde_b < 0)) { // Inconsistency!
-                    tm.end(tx);
-                    return false;
-                }
-                if (likely(solde_a > 0)) {
-                    if (acc_a != acc_b) {
-                        --solde_a;
-                        ++solde_b;
-                    }
-                    if (unlikely(!tm.write(tx, &solde_a, sizeof(int), tm.address(acc_a * sizeof(int)))))
-                        continue;
-                    if (unlikely(!tm.write(tx, &solde_b, sizeof(int), tm.address(acc_b * sizeof(int)))))
-                        continue;
-                }
-                if (unlikely(!tm.end(tx)))
-                    continue;
-            }
-            ++cntr;
-        }
-        chrono.stop();
-        add_tick(chrono);
-        return true;
-    }
-    virtual bool check() {
-        return long_check_tx();
-    }
-};
-
-// -------------------------------------------------------------------------- //
 
 /** Pause execution.
 **/
@@ -585,8 +1038,7 @@ public:
     /** Worker count constructor.
      * @param nbworkers Number of workers to support
     **/
-    Sync(unsigned int nbworkers): nbworkers{nbworkers}, nbready{0}, status{Status::Done} {
-    }
+    Sync(unsigned int nbworkers): nbworkers{nbworkers}, nbready{0}, status{Status::Done} {}
 public:
     /** Master trigger "synchronized" execution in all threads.
     **/
@@ -685,15 +1137,18 @@ static auto measure(Workload& workload, unsigned int const nbthreads, unsigned i
         }, i};
     }
     try {
-        decltype(workload.get_time()) times[nbrepeats];
+        decltype(::std::declval<Chrono>().get_tick()) times[nbrepeats];
         bool res = true;
         for (unsigned int i = 0; i < nbrepeats; ++i) { // Repeat measurement
+            Chrono chrono;
+            chrono.start();
             sync.master_notify();
             if (!sync.master_wait(maxtick)) {
                 res = false;
                 goto join;
             }
-            times[i] = workload.get_time();
+            chrono.stop();
+            times[i] = chrono.get_tick();
         }
         ::std::nth_element(times, times + (nbrepeats >> 1), times + nbrepeats); // Partial-sort times around the median
         join: {
@@ -717,8 +1172,19 @@ static auto measure(Workload& workload, unsigned int const nbthreads, unsigned i
 int main(int argc, char** argv) {
     try {
         if (argc < 3) {
-            ::std::cout << "Usage: " << (argc > 0 ? argv[0] : "grading") << " <seed> <reference library path> <tested library path>..." << ::std::endl;
+            ::std::cout << "Usage: " << (argc > 0 ? argv[0] : "grading") << " [--dynamic] <seed> <reference library path> <tested library path>..." << ::std::endl;
             return 1;
+        }
+        bool dynamic; // Use dynamic memory allocation
+        if (::std::strcmp(argv[1], "--dynamic") == 0) {
+            dynamic = true;
+            { // Pop the argument
+                argv[1] = argv[0];
+                --argc;
+                ++argv;
+            }
+        } else {
+            dynamic = false;
         }
         auto const nbworkers = []() {
             auto res = ::std::thread::hardware_concurrency();
@@ -726,26 +1192,30 @@ int main(int argc, char** argv) {
                 res = 16;
             return static_cast<size_t>(res);
         }();
-        auto const nbtxperwrk   = 1000000ul;
-        auto const nbaccounts   = 4 * nbworkers;
-        auto const init_balance = 100;
-        auto const prob_long    = 0.5f;
-        auto const nbrepeats    = 11;
-        auto const seed         = static_cast<Seed>(::std::stoul(argv[1]));
-        auto const slow_factor  = 2ul;
+        auto const nbtxperwrk    = 400000ul / nbworkers;
+        auto const nbaccounts    = 32 * nbworkers;
+        auto const expnbaccounts = 1024 * nbworkers;
+        auto const init_balance  = 100ul;
+        auto const prob_long     = dynamic ? 0.05f : 0.5f;
+        auto const prob_alloc    = dynamic ? 0.2f : 0.f;
+        auto const nbrepeats     = 7;
+        auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
+        auto const slow_factor   = 2ul;
         ::std::cout << "⎧ #worker threads:     " << nbworkers << ::std::endl;
         ::std::cout << "⎪ #TX per worker:      " << nbtxperwrk << ::std::endl;
         ::std::cout << "⎪ #repetitions:        " << nbrepeats << ::std::endl;
         ::std::cout << "⎪ Initial #accounts:   " << nbaccounts << ::std::endl;
+        ::std::cout << "⎪ Expected #accounts:  " << expnbaccounts << ::std::endl;
         ::std::cout << "⎪ Initial balance:     " << init_balance << ::std::endl;
         ::std::cout << "⎪ Long TX probability: " << prob_long << ::std::endl;
+        ::std::cout << "⎪ Allocation TX prob.: " << prob_alloc << ::std::endl;
         ::std::cout << "⎪ Slow trigger factor: " << slow_factor << ::std::endl;
         ::std::cout << "⎩ Seed value:          " << seed << ::std::endl;
         auto&& eval = [&](char const* path, Chrono::Tick reference) { // Library evaluation
             try {
                 ::std::cout << "⎧ Evaluating '" << path << "'" << (reference == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
                 TransactionalLibrary tl{path};
-                Bank bank{tl, nbaccounts, nbtxperwrk, init_balance, prob_long};
+                Bank bank{tl, nbtxperwrk, nbaccounts, expnbaccounts, init_balance, prob_long, prob_alloc};
                 auto maxtick = [](auto reference) {
                     if (reference == Chrono::invalid_tick)
                         return Chrono::invalid_tick;
@@ -754,9 +1224,15 @@ int main(int argc, char** argv) {
                         ++reference;
                     return reference;
                 }(reference);
-                auto res     = measure(bank, nbworkers, nbrepeats, seed, maxtick);
+                decltype(measure(bank, nbworkers, nbrepeats, seed, maxtick)) res;
+                try {
+                    res = measure(bank, nbworkers, nbrepeats, seed, maxtick);
+                } catch (Exception::TooSlow const& err) { // Special case since interrupting threads may lead to corrupted state
+                    ::std::cerr << "⎪ *** EXCEPTION - main thread ***" << ::std::endl << "⎩ " << err.what() << ::std::endl;
+                    ::std::quick_exit(2);
+                }
                 auto correct = ::std::get<0>(res) && bank.check();
-                auto perf    = ::std::get<1>(res);
+                auto perf    = static_cast<double>(::std::get<1>(res));
                 if (unlikely(!correct)) {
                     ::std::cout << "⎩ Inconsistency detected!" << ::std::endl;
                 } else {
@@ -767,9 +1243,6 @@ int main(int argc, char** argv) {
                     ::std::cout << "⎩ Average TX execution time: " << (perf / static_cast<double>(nbworkers) / static_cast<double>(nbtxperwrk)) << " ns" << ::std::endl;
                 }
                 return ::std::make_tuple(correct, perf);
-            } catch (Exception::TooSlow const& err) { // Special case since interrupting threads may lead to corrupted state
-                ::std::cerr << "⎪ *** EXCEPTION - main thread ***" << ::std::endl << "⎩ " << err.what() << ::std::endl;
-                ::std::exit(1);
             } catch (::std::exception const& err) {
                 ::std::cerr << "⎪ *** EXCEPTION - main thread ***" << ::std::endl << "⎩ " << err.what() << ::std::endl;
                 return ::std::make_tuple(false, 0.);

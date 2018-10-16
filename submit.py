@@ -44,7 +44,7 @@ import socket
 version_uid = b"\x00\x00\x00\x00" # Unique version identifier (must be identical in compatible server)
 
 default_host = "lpd48core.epfl.ch" # Default server hostname
-default_port = 9999                # Default server TCP port
+default_port = 9997                # Default server TCP port
 
 # ---------------------------------------------------------------------------- #
 # Command line
