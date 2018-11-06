@@ -111,9 +111,10 @@ size_t tm_align(shared_t shared as(unused)) {
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
  * @param shared Shared memory region to start a transaction on
+ * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
-tx_t tm_begin(shared_t shared as(unused)) {
+tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused)) {
     // TODO: tm_begin(shared_t)
     return invalid_tx;
 }

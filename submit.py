@@ -41,7 +41,7 @@ import socket
 # ---------------------------------------------------------------------------- #
 # Configuration
 
-version_uid = b"\x00\x00\x00\x00" # Unique version identifier (must be identical in compatible server)
+version_uid = b"\x00\x00\x00\x01" # Unique version identifier (must be identical in compatible server)
 
 default_host = "lpd48core.epfl.ch" # Default server hostname
 default_port = 9997                # Default server TCP port
@@ -63,6 +63,10 @@ parser.add_argument("--port",
   type=int,
   default=default_port,
   help="Server TCP port")
+parser.add_argument("--step",
+  type=int,
+  default=1,
+  help="Which step of the project your submission fulfills")
 parser.add_argument("zippath",
   type=str,
   help="Path to a zip file containing your library code")
@@ -116,6 +120,8 @@ def socket_consume(fd, size):
   data = bytes()
   while size > 0:
     recv = fd.recv(size)
+    if len(recv) <= 0:
+      raise IOError("No more data in the socket")
     data += recv
     size -= len(recv)
   return data
@@ -176,8 +182,8 @@ for af, socktype, proto, canonname, sa in socket.getaddrinfo(args.host, args.por
 if client_fd is None:
   print("Unable to connect to " + str(args.host) + ":" + str(args.port))
   print("Message to the students:")
-  print("  The experiment machine may be in use for other purpose, hence the server is currently not running.")
-  print("  Keep calm and retry later; contact the TAs only if the problem persists for more than a few days.")
+  print("  The server side is currently not running, probably because the server machine is being used for another purpose.")
+  print("  Please keep calm and retry later; contact the TAs only if the problem persists for more than a few days.")
   exit(1)
 atexit.register(lambda: client_fd.close())
 
@@ -194,13 +200,21 @@ if res[0] in msg:
   print(msg[res[0]]) # Unsuccessful identifications are logged
   exit(1)
 
+# Send step ID
+socket_sendfield(client_fd, bytes((args.step,)))
+
 # Send zip file
 socket_sendfield(client_fd, zip_data)
 
 # Read until the socket is closed
-while True:
-  data = client_fd.recv(256)
-  if len(data) <= 0:
-    break
-  sys.stdout.write(data.decode())
-  sys.stdout.flush()
+try:
+  while True:
+    data = client_fd.recv(256)
+    if len(data) <= 0:
+      break
+    sys.stdout.write(data.decode())
+    sys.stdout.flush()
+except ConnectionResetError:
+  pass
+except KeyboardInterrupt:
+  pass

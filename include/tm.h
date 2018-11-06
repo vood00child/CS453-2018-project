@@ -18,7 +18,7 @@
  *
  * @section DESCRIPTION
  *
- * Interface declaration for the transaction manager to use.
+ * Interface declaration for the transaction manager to use (C version).
  * YOU MUST NOT MODIFY THIS FILE.
 **/
 
@@ -48,7 +48,7 @@ void     tm_destroy(shared_t);
 void*    tm_start(shared_t);
 size_t   tm_size(shared_t);
 size_t   tm_align(shared_t);
-tx_t     tm_begin(shared_t);
+tx_t     tm_begin(shared_t, bool);
 bool     tm_end(shared_t, tx_t);
 bool     tm_read(shared_t, tx_t, void const*, size_t, void*);
 bool     tm_write(shared_t, tx_t, void const*, size_t, void*);

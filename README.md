@@ -103,7 +103,7 @@ The student may write her/his library either in C11 (and above) or C++11 (and ab
 
 First iteration (deadline 2018/11/23 23:59:59):
 
-* `struct shared_t`
+* The structure of your _shared memory region_ (i.e. `struct region` in `reference/tm.c`)
 
 * `shared_t tm_create(size_t, size_t)`
 
@@ -115,7 +115,7 @@ First iteration (deadline 2018/11/23 23:59:59):
 
 * `size_t tm_align(shared_t)`
 
-* `tx_t tm_begin(shared_t)`
+* `tx_t tm_begin(shared_t, bool)`
 
 * `bool tm_end(shared_t, tx_t)`
 
@@ -141,7 +141,7 @@ A **shared memory region** is a non-empty set of shared memory segments.
 Shared memory region creation and destruction are respectively managed by `tm_create` and `tm_destroy`.
 The content of the shared memory region is *only* accessed from inside a transaction, and *solely* by the use of the functions mentioned below.
 
-A **transaction** consists of a sequence of `tm_read`, `tm_write`, `tm_alloc`, `tm_free` operations in a shared memory region, enclosed between a call to `tm_begin` and a call to `tm_end` (as well as any number of non-transactional operations).
+A **transaction** consists of a sequence of `tm_read`, `tm_write`, `tm_alloc`, `tm_free` operations in a shared memory region, enclosed between a call to `tm_begin` and a call to `tm_end` (as well as any number of non-transactional operations in private memory).
 A transaction is executed on one and only one shared memory region.
 A transaction either *commits* its speculative updates to the shared memory region when `tm_end` is reached, or *aborts* its execution (discarding its speculative updates) at any time (see the reference).
 When a transaction is aborted, the *user* (i.e. the `grading` tool for this project) is responsible for retrying the *same* transaction (i.e. *going back* to the same `tm_begin` call site).
@@ -252,17 +252,20 @@ Return the alignment (in bytes) of the memory accesses on given shared memory re
 
 Begin a new transaction on the given shared memory region.
 
-* `tx_t tm_begin(shared_t shared);`
+* `tx_t tm_begin(shared_t shared, bool is_ro);`
 
 | Parameter | Description |
 | :-------- | :---------- |
 | `shared` | Shared memory region to start a transaction on |
+| `is_ro` | Whether the transaction will be read-only |
 
 **Return:** Opaque transaction identifier, `invalid_tx` on failure
 
 > **NB:** this function can be called concurrently.
 
 > **NB:** there is no concept of nested transactions, i.e. one transaction started in another transaction.
+
+> **NB:** if `is_ro` is set to true, only `tm_read` can be called in the begun transaction.
 
 &nbsp;
 
@@ -349,8 +352,6 @@ Memory allocation in the given transaction.
 **Return:** One of: `success_alloc` (allocation was successful and transaction can continue), `abort_alloc` (transaction was aborted) and `nomem_alloc` (memory allocation failed)
 
 > **NB:** this function can be called concurrently, concurrent calls must be made with at least a different `shared` parameter or a different `tx` parameter.
-
-> **NB:** the size must be a positive multiple of the shared memory region's alignment.
 
 > **NB:** the pointer `target` can only be dereferenced for the duration of the call.
 

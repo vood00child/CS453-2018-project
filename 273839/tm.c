@@ -1,6 +1,6 @@
 /**
  * @file   tm.c
- * @author [...]
+ * @author Mathieu Ducroux
  *
  * @section LICENSE
  *
@@ -21,9 +21,12 @@
 #endif
 
 // External headers
+#include <stdlib.h>
+#include <setjmp.h>
 
 // Internal headers
 #include <tm.h>
+#include <tmalloc.h>
 
 // -------------------------------------------------------------------------- //
 
@@ -65,6 +68,8 @@
 
 // -------------------------------------------------------------------------- //
 
+typedef uintptr_t vwLock;
+
 struct region
 {
     void *start;        // Start of the shared memory region
@@ -74,6 +79,82 @@ struct region
 };
 
 // -------------------------------------------------------------------------- //
+
+/* =============================================================================
+ * GVInit
+ * =============================================================================
+ */
+__INLINE__ void GVInit()
+{
+    _GCLOCK = 0;
+}
+
+/* =============================================================================
+ * GVRead
+ * =============================================================================
+ */
+__INLINE__ vwLock GVRead(Thread *Self)
+{
+    return _GCLOCK;
+}
+
+/* =============================================================================
+ * TxNewThread
+ * =============================================================================
+ */
+
+Thread *TxNewThread()
+{
+    Thread *t = (Thread *)malloc(sizeof(Thread));
+    assert(t);
+    return t;
+}
+
+/* =============================================================================
+ * TxInitThread
+ * =============================================================================
+ */
+void TxInitThread(Thread *t, long id)
+{
+    /* CCM: so we can access TL2's thread metadata in signal handlers */
+    pthread_setspecific(global_key_self, (void *)t);
+
+    memset(t, 0, sizeof(*t)); /* Default value for most members */
+
+    t->UniqID = id;
+    t->rng = id + 1;
+    t->xorrng[0] = t->rng;
+
+    t->wrSet.List = MakeList(TL2_INIT_WRSET_NUM_ENTRY, t);
+    t->wrSet.put = t->wrSet.List;
+
+    t->rdSet.List = MakeList(TL2_INIT_RDSET_NUM_ENTRY, t);
+    t->rdSet.put = t->rdSet.List;
+
+    t->LocalUndo.List = MakeList(TL2_INIT_LOCAL_NUM_ENTRY, t);
+    t->LocalUndo.put = t->LocalUndo.List;
+
+    t->allocPtr = tmalloc_alloc(1);
+    assert(t->allocPtr);
+    t->freePtr = tmalloc_alloc(1);
+    assert(t->freePtr);
+}
+
+/* =============================================================================
+ * txReset
+ * =============================================================================
+ */
+__INLINE__ void txReset(Thread *Self)
+{
+    Self->Mode = TIDLE;
+
+    Self->rdSet.put = Self->rdSet.List;
+    Self->rdSet.tail = NULL;
+
+    Self->LocalUndo.put = Self->LocalUndo.List;
+    Self->LocalUndo.tail = NULL;
+    Self->HoldsLocks = 0;
+}
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -127,8 +208,26 @@ size_t tm_align(shared_t shared as(unused))
 **/
 tx_t tm_begin(shared_t shared as(unused))
 {
-    // TODO: tm_begin(shared_t)
-    return invalid_tx;
+    // Create a new thread
+    Thread t = TxNewThread();
+    // Initialize it
+    TxInitThread(t, id);
+
+    ASSERT(t->Mode == TIDLE || t->Mode == TABORTED);
+    txReset(t);
+
+    t->rv = GVRead(t);
+    ASSERT((t->rv & LOCKBIT) == 0);
+
+    t->Mode = TTXN;
+    t->envPtr = envPtr;
+
+    ASSERT(t->LocalUndo.put == t->LocalUndo.List);
+    ASSERT(t->wrSet.put == t->wrSet.List);
+
+    t->Starts++;
+
+    return t.uniqID;
 }
 
 /** [thread-safe] End the given transaction.
@@ -138,7 +237,16 @@ tx_t tm_begin(shared_t shared as(unused))
 **/
 bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
 {
-    // TODO: tm_end(shared_t, tx_t)
+    ASSERT(Self->Mode == TTXN);
+    if (Self->wrSet.put == Self->wrSet.List)
+    {
+        /* Given TL2 the read-set is already known to be coherent. */
+        txCommitReset(Self);
+        tmalloc_clear(Self->allocPtr);
+        tmalloc_releaseAllForward(Self->freePtr, &txSterilize);
+        return true;
+    }
+    TxAbort(Self);
     return false;
 }
 

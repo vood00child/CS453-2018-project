@@ -137,6 +137,7 @@ static void link_remove(struct link* link) {
 **/
 // #define USE_PTHREAD_LOCK
 // #define USE_TICKET_LOCK
+#define USE_RW_LOCK
 
 /** Pause for a very short amount of time.
 **/
@@ -184,6 +185,14 @@ static void lock_release(struct lock_t* lock) {
     pthread_mutex_unlock(&(lock->mutex));
 }
 
+static bool lock_acquire_shared(struct lock_t* lock) {
+    return lock_acquire(lock);
+}
+
+static void lock_release_shared(struct lock_t* lock) {
+    lock_release(lock);
+}
+
 #elif defined(USE_TICKET_LOCK)
 
 struct lock_t {
@@ -225,6 +234,65 @@ static bool lock_acquire(struct lock_t* lock) {
 **/
 static void lock_release(struct lock_t* lock) {
     atomic_fetch_add_explicit(&(lock->pass), 1, memory_order_release);
+}
+
+static bool lock_acquire_shared(struct lock_t* lock) {
+    return lock_acquire(lock);
+}
+
+static void lock_release_shared(struct lock_t* lock) {
+    lock_release(lock);
+}
+
+#elif defined(USE_RW_LOCK)
+
+struct lock_t {
+    pthread_rwlock_t rwlock;
+};
+
+/** Initialize the given lock.
+ * @param lock Lock to initialize
+ * @return Whether the operation is a success
+**/
+static bool lock_init(struct lock_t* lock) {
+    return (0 == pthread_rwlock_init(&lock->rwlock, NULL));
+}
+
+/** Clean the given lock up.
+ * @param lock Lock to clean up
+**/
+static void lock_cleanup(struct lock_t* lock as(unused)) {
+    pthread_rwlock_destroy(&lock->rwlock);
+}
+
+/** Wait and acquire the given lock.
+ * @param lock Lock to acquire
+ * @return Whether the operation is a success
+**/
+static bool lock_acquire(struct lock_t* lock) {
+    return (0 == pthread_rwlock_wrlock(&lock->rwlock));
+}
+
+/** Release the given lock.
+ * @param lock Lock to release
+**/
+static void lock_release(struct lock_t* lock) {
+    pthread_rwlock_unlock(&lock->rwlock);
+}
+
+/** Wait and acquire the given lock.
+ * @param lock Lock to acquire
+ * @return Whether the operation is a success
+**/
+static bool lock_acquire_shared(struct lock_t* lock) {
+    return (0 == pthread_rwlock_rdlock(&lock->rwlock));
+}
+
+/** Release the given lock.
+ * @param lock Lock to release
+**/
+static void lock_release_shared(struct lock_t* lock) {
+    pthread_rwlock_unlock(&lock->rwlock);
 }
 
 #else // Test-and-test-and-set
@@ -270,9 +338,21 @@ static void lock_release(struct lock_t* lock) {
     atomic_store_explicit(&(lock->locked), false, memory_order_release);
 }
 
+static bool lock_acquire_shared(struct lock_t* lock) {
+    return lock_acquire(lock);
+}
+
+static void lock_release_shared(struct lock_t* lock) {
+    lock_release(lock);
+}
+
 #endif
 
 // -------------------------------------------------------------------------- //
+
+static const tx_t read_only_tx = UINTPTR_MAX-10;
+static const tx_t read_write_tx = UINTPTR_MAX-11;
+
 
 struct region {
     struct lock_t lock; // Global lock
@@ -333,14 +413,26 @@ size_t tm_align(shared_t shared) {
     return ((struct region*) shared)->align;
 }
 
-tx_t tm_begin(shared_t shared) {
-    if (unlikely(!lock_acquire(&(((struct region*) shared)->lock))))
-        return invalid_tx;
-    return invalid_tx + 1; // There can be only one transaction running => ID is useless
+tx_t tm_begin(shared_t shared, bool is_ro) {
+    if (is_ro) {
+        if (unlikely(!lock_acquire_shared(&(((struct region*) shared)->lock))))
+            return invalid_tx;
+        return read_only_tx; 
+    } else {
+        if (unlikely(!lock_acquire(&(((struct region*) shared)->lock))))
+            return invalid_tx;
+        return read_write_tx; 
+    }
 }
 
-bool tm_end(shared_t shared, tx_t tx as(unused)) {
-    lock_release(&(((struct region*) shared)->lock));
+bool tm_end(shared_t shared, tx_t tx) {
+    if (tx == read_only_tx) { // read-only
+
+        lock_release_shared(&(((struct region*) shared)->lock));
+    } else { // read-write
+
+        lock_release(&(((struct region*) shared)->lock));
+    }
     return true;
 }
 
