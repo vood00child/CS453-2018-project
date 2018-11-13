@@ -23,10 +23,17 @@
 // External headers
 #include <stdlib.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 
 // Internal headers
+#include "tm_c.h"
 #include <tm.h>
-#include <tmalloc.h>
+
+#if (defined(__i386__) || defined(__x86_64__)) && defined(USE_MM_PAUSE)
+#include <xmmintrin.h>
+#else
+#include <sched.h>
+#endif
 
 // -------------------------------------------------------------------------- //
 
@@ -68,38 +75,340 @@
 
 // -------------------------------------------------------------------------- //
 
-typedef uintptr_t vwLock;
-
-struct region
-{
-    void *start;        // Start of the shared memory region
-    size_t size;        // Size of the shared memory region (in bytes)
-    size_t align;       // Claimed alignment of the shared memory region (in bytes)
-    size_t align_alloc; // Actual alignment of the memory allocations (in bytes)
-};
-
-// -------------------------------------------------------------------------- //
+/*
+ * We use GClock[32] as the global counter.  It must be the sole occupant
+ * of its cache line to avoid false sharing.  Even so, accesses to
+ * GCLock will cause significant cache coherence & communication costs
+ * as it is multi-read multi-write.
+ */
+static volatile vwLock GClock[TL2_CACHE_LINE_SIZE];
+#define _GCLOCK GClock[32]
 
 /* =============================================================================
- * GVInit
+ * GVInit: Initialize the global version clock
  * =============================================================================
  */
-__INLINE__ void GVInit()
+static __inline__ void GVInit()
 {
     _GCLOCK = 0;
 }
 
 /* =============================================================================
- * GVRead
+ * GVRead: Read the global version clock
  * =============================================================================
  */
-__INLINE__ vwLock GVRead(Thread *Self)
+static __inline__ vwLock GVRead(Thread *Self)
 {
     return _GCLOCK;
 }
 
 /* =============================================================================
- * TxNewThread
+ * OwnerOf: Return the owner of a given lock
+ * =============================================================================
+ */
+static __inline__ Thread *OwnerOf(vwLock v)
+{
+    return ((v & LOCKBIT) ? (((AVPair *)(v ^ LOCKBIT))->Owner) : NULL);
+}
+
+/* =============================================================================
+ * MarsagliaXORV
+ *
+ * Simplistlic low-quality Marsaglia SHIFT-XOR RNG.
+ * Bijective except for the trailing mask operation.
+ * =============================================================================
+ */
+static __inline__ unsigned long long MarsagliaXORV(unsigned long long x)
+{
+    if (x == 0)
+    {
+        x = 1;
+    }
+    x ^= x << 6;
+    x ^= x >> 21;
+    x ^= x << 7;
+    return x;
+}
+
+/* =============================================================================
+ * MarsagliaXOR
+ *
+ * Simplistlic low-quality Marsaglia SHIFT-XOR RNG.
+ * Bijective except for the trailing mask operation.
+ * =============================================================================
+ */
+static __inline__ unsigned long long MarsagliaXOR(unsigned long long *seed)
+{
+    unsigned long long x = MarsagliaXORV(*seed);
+    *seed = x;
+    return x;
+}
+
+/* =============================================================================
+ * AtomicAdd
+ * =============================================================================
+ */
+static __inline__ intptr_t AtomicAdd(volatile intptr_t *addr, intptr_t dx)
+{
+    intptr_t v;
+    for (v = *addr; CAS(addr, v, v + dx) != v; v = *addr)
+    {
+    }
+    return (v + dx);
+}
+
+/* =============================================================================
+ * RestoreLocks: Unlock every entry of the write-set of the thread (set the lock
+ * to the read-version at time of 1st read observed)
+ * =============================================================================
+ */
+static __inline__ void RestoreLocks(Thread *Self)
+{
+    Log *wr = &Self->wrSet;
+    AVPair *p;
+    AVPair *const End = wr->put;
+    for (p = wr->List; p != End; p = p->Next)
+    {
+        ASSERT(p->Addr != NULL);
+        ASSERT(p->LockFor != NULL);
+        if (p->Held == 0)
+        {
+            continue;
+        }
+        ASSERT(OwnerOf(*(p->LockFor)) == Self);
+        ASSERT(*(p->LockFor) == ((uintptr_t)(p) | LOCKBIT));
+        ASSERT((p->rdv & LOCKBIT) == 0);
+        p->Held = 0;
+        *(p->LockFor) = p->rdv;
+    }
+    Self->HoldsLocks = 0;
+}
+
+/* =============================================================================
+ * ReadSetCoherentPessimistic: return 0 as soon as we discover inconsistency.
+ * =============================================================================
+ */
+static __inline__ long ReadSetCoherentPessimistic(Thread *Self)
+{
+    vwLock rv = Self->rv;
+    Log *const rd = &Self->rdSet;
+    AVPair *const EndOfList = rd->put;
+    AVPair *e;
+
+    ASSERT((rv & LOCKBIT) == 0);
+
+    for (e = rd->List; e != EndOfList; e = e->Next)
+    {
+        ASSERT(e->LockFor != NULL);
+        vwLock v = *(e->LockFor);
+        if (v & LOCKBIT)
+        {
+            if ((uintptr_t)(((AVPair *)((uintptr_t)(v) ^ LOCKBIT))->Owner) != (uintptr_t)(Self))
+            {
+                return 0;
+            }
+        }
+        else
+        {
+            if (v > rv)
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+/* =============================================================================
+ * MakeList
+ *
+ * Allocate the primary list as a large chunk so we can guarantee ascending &
+ * adjacent addresses through the list. This improves D$ and DTLB behavior.
+ * =============================================================================
+ */
+static __inline__ AVPair *MakeList(long sz, Thread *Self)
+{
+    AVPair *ap = (AVPair *)malloc((sizeof(*ap) * sz) + TL2_CACHE_LINE_SIZE);
+    assert(ap);
+    memset(ap, 0, sizeof(*ap) * sz);
+    AVPair *List = ap;
+    AVPair *Tail = NULL;
+    long i;
+    for (i = 0; i < sz; i++)
+    {
+        AVPair *e = ap++;
+        e->Next = ap;
+        e->Prev = Tail;
+        e->Owner = Self;
+        e->Ordinal = i;
+        Tail = e;
+    }
+    Tail->Next = NULL;
+
+    return List;
+}
+
+/* =============================================================================
+ * ExtendList
+ *
+ * Postpend at the tail. We want the front of the list, which sees the most
+ * traffic, to remains contiguous.
+ * =============================================================================
+ */
+static __inline__ AVPair *ExtendList(AVPair *tail)
+{
+    AVPair *e = (AVPair *)malloc(sizeof(*e));
+    assert(e);
+    memset(e, 0, sizeof(*e));
+    tail->Next = e;
+    e->Prev = tail;
+    e->Next = NULL;
+    e->Owner = tail->Owner;
+    e->Ordinal = tail->Ordinal + 1;
+    /*e->Held    = 0; -- done by memset*/
+    return e;
+}
+
+/* =============================================================================
+ * FreeList
+ * =============================================================================
+ */
+void FreeList(Log *, long) __attribute__((noinline));
+/*__INLINE__*/ void FreeList(Log *k, long sz)
+{
+    /* Free appended overflow entries first */
+    AVPair *e = k->end;
+    if (e != NULL)
+    {
+        while (e->Ordinal >= sz)
+        {
+            AVPair *tmp = e;
+            e = e->Prev;
+            free(tmp);
+        }
+    }
+
+    /* Free continguous beginning */
+    free(k->List);
+}
+
+/* =============================================================================
+ * TrackLoad
+ * =============================================================================
+ */
+static __inline__ int TrackLoad(Thread *Self, volatile vwLock *LockFor)
+{
+    Log *k = &(Self->rdSet);
+
+    /*
+     * Consider collapsing back-to-back track loads ...
+     * if the previous LockFor and rdv match the incoming arguments then
+     * simply return
+     */
+
+    /*
+     * Read log overflow suggests a rogue or incoherent transaction.
+     * Consider calling SpeculativeReadSetCoherent() and, if needed, TxAbort().
+     * This lets us distinguish between a doomed txn that's gone rogue
+     * and a large transaction that legitimately overflows the buffer.
+     * In the latter case we might extend the buffer or chain an overflow
+     * buffer onto "k".
+     * Options: print, abort, panic, extend, ignore & discard
+     * Beware of inlining effects - TrackLoad() is performance-critical.
+     * Decreasing the sample period tunable in TxValid() will reduce the
+     * rate of overflows caused by zombie transactions.
+     */
+
+    AVPair *e = k->put;
+    if (e == NULL)
+    {
+        if (!ReadSetCoherentPessimistic(Self))
+        {
+            return 0;
+        }
+        k->ovf++;
+        e = ExtendList(k->tail);
+        k->end = e;
+    }
+
+    k->tail = e;
+    k->put = e->Next;
+    e->LockFor = LockFor;
+    /* Note that Val and Addr fields are undefined for tracked loads */
+
+    return 1;
+}
+
+/* =============================================================================
+ * WriteBackReverse
+ *
+ * Transfer the data in the log its ultimate location.
+ * =============================================================================
+ */
+static __inline__ void WriteBackReverse(Log *k)
+{
+    AVPair *e;
+    for (e = k->tail; e != NULL; e = e->Prev)
+    {
+        *(e->Addr) = e->Val;
+    }
+}
+
+/* =============================================================================
+ * backoff
+ * =============================================================================
+ */
+static __inline__ void backoff(Thread *Self, long attempt)
+{
+    unsigned long long stall = 1;
+    MarsagliaXOR(&Self->rng) & 0xF;
+    stall += attempt >> 2;
+    stall *= 10;
+
+    /* CCM: timer function may misbehave */
+    volatile typeof(stall) i = 0;
+    while (i++ < stall)
+    {
+        PAUSE();
+    }
+}
+
+/* =============================================================================
+ * RecordStore
+ * =============================================================================
+ */
+
+static __inline__ void RecordStore(Log *k, volatile intptr_t *Addr, intptr_t Val, volatile vwLock *Lock)
+{
+    /*
+     * As an optimization we could squash multiple stores to the same location.
+     * Maintain FIFO order to avoid WAW hazards.
+     * TODO-FIXME - CONSIDER
+     * Keep Self->LockSet as a sorted linked list of unique LockFor addresses.
+     * We'd scan the LockSet for Lock.  If not found we'd insert a new
+     * LockRecord at the appropriate location in the list.
+     * Call InsertIfAbsent (Self, LockFor)
+     */
+    AVPair *e = k->put;
+    if (e == NULL)
+    {
+        k->ovf++;
+        e = ExtendList(k->tail);
+        k->end = e;
+    }
+    ASSERT(Addr != NULL);
+    k->tail = e;
+    k->put = e->Next;
+    e->Addr = Addr;
+    e->Val = Val;
+    e->LockFor = Lock;
+    e->Held = 0;
+    e->rdv = LOCKBIT; /* use either 0 or LOCKBIT */
+}
+
+/* =============================================================================
+ * TxNewThread: Allocate a new thread-local transaction object
  * =============================================================================
  */
 
@@ -111,19 +420,19 @@ Thread *TxNewThread()
 }
 
 /* =============================================================================
- * TxInitThread
+ * TxInitThread: Initialize the transaction object
  * =============================================================================
  */
-void TxInitThread(Thread *t, long id)
+void TxInitThread(Thread *t)
 {
     /* CCM: so we can access TL2's thread metadata in signal handlers */
-    pthread_setspecific(global_key_self, (void *)t);
+    // pthread_setspecific(global_key_self, (void *)t);
 
     memset(t, 0, sizeof(*t)); /* Default value for most members */
 
-    t->UniqID = id;
-    t->rng = id + 1;
-    t->xorrng[0] = t->rng;
+    // t->rng = id + 1;
+    // t->xorrng[0] = t->rng;
+    t->UniqID = (tx_t)t; /* The id corresponds to the address of the thread */
 
     t->wrSet.List = MakeList(TL2_INIT_WRSET_NUM_ENTRY, t);
     t->wrSet.put = t->wrSet.List;
@@ -134,17 +443,17 @@ void TxInitThread(Thread *t, long id)
     t->LocalUndo.List = MakeList(TL2_INIT_LOCAL_NUM_ENTRY, t);
     t->LocalUndo.put = t->LocalUndo.List;
 
-    t->allocPtr = tmalloc_alloc(1);
-    assert(t->allocPtr);
-    t->freePtr = tmalloc_alloc(1);
-    assert(t->freePtr);
+    // t->allocPtr = tmalloc_alloc(1);
+    // assert(t->allocPtr);
+    // t->freePtr = tmalloc_alloc(1);
+    // assert(t->freePtr);
 }
 
 /* =============================================================================
  * txReset
  * =============================================================================
  */
-__INLINE__ void txReset(Thread *Self)
+static __inline__ void txReset(Thread *Self)
 {
     Self->Mode = TIDLE;
 
@@ -156,23 +465,181 @@ __INLINE__ void txReset(Thread *Self)
     Self->HoldsLocks = 0;
 }
 
+/* =============================================================================
+ * txSterilize
+ *
+ * Use txSterilize() any time an object passes out of the transactional domain
+ * and will be accessed solely with normal non-transactional load and store
+ * operations.
+ * =============================================================================
+ */
+static void txSterilize(void *Base, size_t Length)
+{
+    intptr_t *Addr = (intptr_t *)Base;
+    intptr_t *End = Addr + Length;
+    ASSERT(Addr <= End);
+    while (Addr < End)
+    {
+        volatile vwLock *Lock = PSLOCK(Addr);
+        intptr_t val = *Lock;
+        /* CCM: invalidate future readers */
+        CAS(Lock, val, (_GCLOCK & ~LOCKBIT));
+        Addr++;
+    }
+    memset(Base, (unsigned char)TL2_USE_AFTER_FREE_MARKER, Length);
+}
+
+/* =============================================================================
+ * TxAbort
+ *
+ * Our mechanism admits mutual abort with no progress - livelock.
+ * Consider the following scenario where T1 and T2 execute concurrently:
+ * Thread T1:  WriteLock A; Read B LockWord; detect locked, abort, retry
+ * Thread T2:  WriteLock B; Read A LockWord; detect locked, abort, retry
+ *
+ * Possible solutions:
+ *
+ * - Try backoff (random and/or exponential), with some mixture
+ *   of yield or spinning.
+ *
+ * - Use a form of deadlock detection and arbitration.
+ *
+ * In practice it's likely that a semi-random semi-exponential back-off
+ * would be best.
+ * =============================================================================
+ */
+void TxAbort(Thread *Self)
+{
+    Self->Mode = TABORTED;
+    if (Self->HoldsLocks)
+    {
+        RestoreLocks(Self);
+    }
+
+    /* Clean up after an abort. Restore any modified locals */
+    if (Self->LocalUndo.put != Self->LocalUndo.List)
+    {
+        WriteBackReverse(&Self->LocalUndo);
+    }
+
+    Self->Retries++;
+    Self->Aborts++;
+    if (Self->Retries > 3) /* TUNABLE */
+    {
+        backoff(Self, Self->Retries);
+    }
+}
+
+/* =============================================================================
+ * TxLoad
+ * =============================================================================
+ */
+
+int TxLoad(Thread *Self, volatile intptr_t *Addr, volatile intptr_t *target, size_t alignment)
+{
+    ASSERT(Self->Mode == TTXN);
+
+    /* Tx previously wrote to the location: return value from write-set */
+    intptr_t msk = FILTERBITS(Addr);
+    if ((Self->wrSet.BloomFilter & msk) == msk)
+    {
+        Log *wr = &(Self->wrSet);
+        AVPair *e;
+        for (e = wr->tail; e != NULL; e = e->Prev)
+        {
+            ASSERT(e->Addr != NULL);
+            if (e->Addr == Addr)
+            {
+                memcpy(target, &(e->Val), alignment);
+                return 0;
+            }
+        }
+    }
+
+    /* Tx has not been written to the location: add to read-set and read from memory */
+    volatile vwLock *LockFor = PSLOCK(Addr);
+    vwLock rdv = *(LockFor) & ~LOCKBIT;
+    /* We need to check that the location is not locked by another committing transaction
+    and that its version is less than or equal to our transaction’s read version */
+    if (rdv <= Self->rv && *(LockFor) == rdv)
+    {
+        if (!TrackLoad(Self, LockFor))
+        {
+            TxAbort(Self);
+        }
+        memcpy(target, Addr, alignment);
+        return 0;
+    }
+    TxAbort(Self);
+    return -1;
+}
+
+/* =============================================================================
+ * TxFreeThread
+ * =============================================================================
+ */
+void TxFreeThread(Thread *t)
+{
+    AtomicAdd((volatile intptr_t *)((void *)(&ReadOverflowTally)), t->rdSet.ovf);
+
+    long wrSetOvf = 0;
+    Log *wr;
+    wr = &t->wrSet;
+    {
+        wrSetOvf += wr->ovf;
+    }
+    AtomicAdd((volatile intptr_t *)((void *)(&WriteOverflowTally)), wrSetOvf);
+
+    AtomicAdd((volatile intptr_t *)((void *)(&LocalOverflowTally)), t->LocalUndo.ovf);
+
+    AtomicAdd((volatile intptr_t *)((void *)(&StartTally)), t->Starts);
+    AtomicAdd((volatile intptr_t *)((void *)(&AbortTally)), t->Aborts);
+
+    // tmalloc_free(t->allocPtr);
+    // tmalloc_free(t->freePtr);
+
+    FreeList(&(t->rdSet), TL2_INIT_RDSET_NUM_ENTRY);
+    FreeList(&(t->wrSet), TL2_INIT_WRSET_NUM_ENTRY);
+    FreeList(&(t->LocalUndo), TL2_INIT_LOCAL_NUM_ENTRY);
+
+    free(t);
+}
+
+// -------------------------------------------------------------------------- //
+
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
-shared_t tm_create(size_t size as(unused), size_t align as(unused))
+shared_t tm_create(size_t size, size_t align)
 {
-    // TODO: tm_create(size_t, size_t)
-    return invalid_shared;
+    struct region *region = (struct region *)malloc(sizeof(struct region));
+    if (unlikely(!region))
+    {
+        return invalid_shared;
+    }
+    size_t align_alloc = align < sizeof(void *) ? sizeof(void *) : align;
+    if (unlikely(posix_memalign(&(region->start), align_alloc, size) != 0))
+    {
+        free(region);
+        return invalid_shared;
+    }
+    memset(region->start, 0, size);
+    region->size = size;
+    region->align = align;
+    region->align_alloc = align_alloc;
+    return region;
 }
 
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
 **/
-void tm_destroy(shared_t shared as(unused))
+void tm_destroy(shared_t shared)
 {
-    // TODO: tm_destroy(shared_t)
+    struct region *region = (struct region *)shared;
+    free(region->start);
+    free(region);
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -188,7 +655,7 @@ void *tm_start(shared_t shared)
  * @param shared Shared memory region to query
  * @return First allocated segment size
 **/
-size_t tm_size(shared_t shared as(unused))
+size_t tm_size(shared_t shared)
 {
     return ((struct region *)shared)->size;
 }
@@ -197,7 +664,7 @@ size_t tm_size(shared_t shared as(unused))
  * @param shared Shared memory region to query
  * @return Alignment used globally
 **/
-size_t tm_align(shared_t shared as(unused))
+size_t tm_align(shared_t shared)
 {
     return ((struct region *)shared)->align;
 }
@@ -206,12 +673,10 @@ size_t tm_align(shared_t shared as(unused))
  * @param shared Shared memory region to start a transaction on
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
-tx_t tm_begin(shared_t shared as(unused))
+tx_t tm_begin(shared_t shared, bool is_ro as(unused))
 {
-    // Create a new thread
-    Thread t = TxNewThread();
-    // Initialize it
-    TxInitThread(t, id);
+    Thread *t = TxNewThread(); /* Create a new thread */
+    TxInitThread(t);           /* Initialize it */
 
     ASSERT(t->Mode == TIDLE || t->Mode == TABORTED);
     txReset(t);
@@ -220,14 +685,11 @@ tx_t tm_begin(shared_t shared as(unused))
     ASSERT((t->rv & LOCKBIT) == 0);
 
     t->Mode = TTXN;
-    t->envPtr = envPtr;
 
     ASSERT(t->LocalUndo.put == t->LocalUndo.List);
     ASSERT(t->wrSet.put == t->wrSet.List);
 
-    t->Starts++;
-
-    return t.uniqID;
+    return ((tx_t)t);
 }
 
 /** [thread-safe] End the given transaction.
@@ -235,19 +697,31 @@ tx_t tm_begin(shared_t shared as(unused))
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
+bool tm_end(shared_t shared, tx_t tx)
 {
-    ASSERT(Self->Mode == TTXN);
-    if (Self->wrSet.put == Self->wrSet.List)
+    Thread *t = (Thread *)tx;
+
+    ASSERT(t->Mode == TTXN);
+
+    if (t->wrSet.put == t->wrSet.List)
     {
         /* Given TL2 the read-set is already known to be coherent. */
-        txCommitReset(Self);
-        tmalloc_clear(Self->allocPtr);
-        tmalloc_releaseAllForward(Self->freePtr, &txSterilize);
-        return true;
+        txCommitReset(t);
+        // tmalloc_clear(t->allocPtr);
+        tmalloc_releaseAllForward(t->freePtr, &txSterilize);
+        return 1;
     }
-    TxAbort(Self);
-    return false;
+
+    if (TryFastUpdate(t))
+    {
+        txCommitReset(t);
+        // tmalloc_clear(t->allocPtr);
+        tmalloc_releaseAllForward(t->freePtr, &txSterilize);
+        return 1;
+    }
+
+    TxAbort(t);
+    return 0;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -258,10 +732,43 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const *source as(unused), size_t size as(unused), void *target as(unused))
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    Thread *t = (Thread *)t;
+
+    size_t alignment = tm_align(shared);
+    if (size % alignment != 0)
+    {
+        return false;
+    }
+
+    void *tmp_slot = (void *)calloc(sizeof(char *), size);
+    if (unlikely(!tmp_slot))
+    {
+        return false;
+    }
+
+    size_t number_of_items = size / alignment; // number of items we want to read
+    void *current_src_slot = source;
+    size_t tmp_slot_index = 0;
+    int err_load = 0;
+    for (size_t i = 0; i < number_of_items; i++)
+    {
+        err_load = TxLoad(t, (intptr_t *)(current_src_slot), &tmp_slot[tmp_slot_index], alignment);
+
+        if (err_load == -1)
+        {
+            free(tmp_slot);
+            return false;
+        }
+
+        // You may want to replace char* by uintptr_t
+        current_src_slot = alignment + (char *)current_src_slot;
+        tmp_slot_index += alignment;
+    }
+    memcopy(target, tmp_slot, size);
+    free(tmp_slot);
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -272,10 +779,45 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const *source 
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source as(unused), size_t size as(unused), void *target as(unused))
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    volatile vwLock *LockFor;
+    vwLock rdv;
+
+    ASSERT(tx->Mode == TTXN);
+
+    LockFor = PSLOCK(addr);
+    rdv = *(LockFor);
+
+    Log *wr = &tx->wrSet;
+
+    if (memcmp(target, source, size) == 0)
+    {
+        AVPair *e;
+        for (e = wr->tail; e != NULL; e = e->Prev)
+        {
+            ASSERT(e->Addr != NULL);
+            if (e->Addr == target)
+            {
+                ASSERT(LockFor == e->LockFor);
+                memcopy(e->Val, source, size); /* update associated value in write-set */
+                return true;
+            }
+        }
+        /* Not writing new value; convert to load */
+        if ((rdv & LOCKBIT) == 0 && rdv <= tx->rv && *(LockFor) == rdv)
+        {
+            if (!TrackLoad(tx, LockFor))
+            {
+                TxAbort(tx);
+            }
+            return true;
+        }
+    }
+
+    wr->BloomFilter |= FILTERBITS(addr);
+    RecordStore(wr, addr, valu, LockFor);
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
