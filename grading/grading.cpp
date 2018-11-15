@@ -1430,7 +1430,8 @@ int main(int argc, char **argv)
             auto res = ::std::thread::hardware_concurrency();
             if (unlikely(res == 0))
                 res = 16;
-            return static_cast<size_t>(res);
+            // return static_cast<size_t>(res);
+            return 1;
         }();
         auto const nbtxperwrk = 400000ul / nbworkers;
         auto const nbaccounts = 32 * nbworkers;

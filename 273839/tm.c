@@ -24,6 +24,9 @@
 #include <stdlib.h>
 #include <setjmp.h>
 #include <stdatomic.h>
+#include <assert.h>
+#include <string.h>
+#include <stdio.h>
 
 // Internal headers
 #include "tm_c.h"
@@ -75,6 +78,15 @@
 
 // -------------------------------------------------------------------------- //
 
+#ifndef _GVCONFIGURATION
+#define _GVCONFIGURATION 4
+#endif
+
+#if _GVCONFIGURATION == 4
+#define _GVFLAVOR "GV4"
+#define GVGenerateWV GVGenerateWV_GV4
+#endif
+
 /*
  * We use GClock[32] as the global counter.  It must be the sole occupant
  * of its cache line to avoid false sharing.  Even so, accesses to
@@ -97,9 +109,45 @@ static __inline__ void GVInit()
  * GVRead: Read the global version clock
  * =============================================================================
  */
-static __inline__ vwLock GVRead(Thread *Self)
+static __inline__ vwLock GVRead(Thread *Self as(unused))
 {
     return _GCLOCK;
+}
+
+/* =============================================================================
+ * GVGenerateWV_GV4
+ *
+ * The GV4 form of GVGenerateWV() does not have a CAS retry loop. If the CAS
+ * fails then we have 2 writers that are racing, trying to bump the global
+ * clock. One increment succeeded and one failed. Because the 2 writers hold
+ * locks at the time we bump, we know that their write-sets don't intersect. If
+ * the write-set of one thread intersects the read-set of the other then we know
+ * that one will subsequently fail validation (either because the lock associated
+ * with the read-set entry is held by the other thread, or because the other
+ * thread already made the update and dropped the lock, installing the new
+ * version #). In this particular case it's safe if two threads call
+ * GVGenerateWV() concurrently and they both generate the same (duplicate) WV.
+ * That is, if we have writers that concurrently try to increment the
+ * clock-version and then we allow them both to use the same wv. The failing
+ * thread can "borrow" the wv of the successful thread.
+ * =============================================================================
+ */
+static __inline__ vwLock GVGenerateWV_GV4(Thread *Self, vwLock maxv)
+{
+    vwLock gv = _GCLOCK;
+    vwLock wv = gv + 2;
+    vwLock k = CAS(&_GCLOCK, gv, wv);
+    if (k != gv)
+    {
+        wv = k;
+    }
+    assert((wv & LOCKBIT) == 0);
+    assert(wv != 0); /* overflow */
+    assert(wv > Self->wv);
+    assert(wv > Self->rv);
+    assert(wv > maxv);
+    Self->wv = wv;
+    return wv;
 }
 
 /* =============================================================================
@@ -165,23 +213,87 @@ static __inline__ intptr_t AtomicAdd(volatile intptr_t *addr, intptr_t dx)
 static __inline__ void RestoreLocks(Thread *Self)
 {
     Log *wr = &Self->wrSet;
-    AVPair *p;
-    AVPair *const End = wr->put;
-    for (p = wr->List; p != End; p = p->Next)
     {
-        ASSERT(p->Addr != NULL);
-        ASSERT(p->LockFor != NULL);
-        if (p->Held == 0)
+        AVPair *p;
+        AVPair *const End = wr->put;
+        for (p = wr->List; p != End; p = p->Next)
         {
-            continue;
+            assert(p->Addr != NULL);
+            assert(p->LockFor != NULL);
+            if (p->Held == 0)
+            {
+                continue;
+            }
+            assert(OwnerOf(*(p->LockFor)) == Self);
+            assert(*(p->LockFor) == ((uintptr_t)(p) | LOCKBIT));
+            assert((p->rdv & LOCKBIT) == 0);
+            p->Held = 0;
+            *(p->LockFor) = p->rdv;
         }
-        ASSERT(OwnerOf(*(p->LockFor)) == Self);
-        ASSERT(*(p->LockFor) == ((uintptr_t)(p) | LOCKBIT));
-        ASSERT((p->rdv & LOCKBIT) == 0);
-        p->Held = 0;
-        *(p->LockFor) = p->rdv;
     }
     Self->HoldsLocks = 0;
+}
+
+/* =============================================================================
+ * DropLocks
+ * =============================================================================
+ */
+static __inline__ void DropLocks(Thread *Self, vwLock wv)
+{
+    Log *wr = &Self->wrSet;
+    {
+        AVPair *p;
+        AVPair *const End = wr->put;
+        for (p = wr->List; p != End; p = p->Next)
+        {
+            assert(p->Addr != NULL);
+            assert(p->LockFor != NULL);
+            if (p->Held == 0)
+            {
+                continue;
+            }
+            p->Held = 0;
+            assert(wv > p->rdv);
+            assert(OwnerOf(*(p->LockFor)) == Self);
+            assert(*(p->LockFor) == ((uintptr_t)(p) | LOCKBIT));
+            *(p->LockFor) = wv;
+        }
+    }
+    Self->HoldsLocks = 0;
+}
+
+/* =============================================================================
+ * ReadSetCoherent
+ *
+ * Is the read-set mutually consistent? Can be called at any time--before the
+ * caller acquires locks or after.
+ * =============================================================================
+ */
+static __inline__ long ReadSetCoherent(Thread *Self)
+{
+    intptr_t dx = 0;
+    vwLock rv = Self->rv;
+    Log *const rd = &Self->rdSet;
+    AVPair *const EndOfList = rd->put;
+    AVPair *e;
+
+    assert((rv & LOCKBIT) == 0);
+
+    for (e = rd->List; e != EndOfList; e = e->Next)
+    {
+        assert(e->LockFor != NULL);
+        vwLock v = *(e->LockFor);
+        if (v & LOCKBIT)
+        {
+            dx |= (uintptr_t)(((AVPair *)((uintptr_t)(v) & ~LOCKBIT))->Owner) ^ (uintptr_t)(Self);
+        }
+        else
+        {
+            dx |= (v > rv);
+        }
+    }
+
+    return (dx == 0);
 }
 
 /* =============================================================================
@@ -195,11 +307,11 @@ static __inline__ long ReadSetCoherentPessimistic(Thread *Self)
     AVPair *const EndOfList = rd->put;
     AVPair *e;
 
-    ASSERT((rv & LOCKBIT) == 0);
+    assert((rv & LOCKBIT) == 0);
 
     for (e = rd->List; e != EndOfList; e = e->Next)
     {
-        ASSERT(e->LockFor != NULL);
+        assert(e->LockFor != NULL);
         vwLock v = *(e->LockFor);
         if (v & LOCKBIT)
         {
@@ -341,6 +453,22 @@ static __inline__ int TrackLoad(Thread *Self, volatile vwLock *LockFor)
 }
 
 /* =============================================================================
+ * WriteBackForward
+ *
+ * Transfer the data in the log its ultimate location.
+ * =============================================================================
+ */
+static __inline__ void WriteBackForward(Log *k)
+{
+    AVPair *e;
+    AVPair *End = k->put;
+    for (e = k->List; e != End; e = e->Next)
+    {
+        *(e->Addr) = e->Val;
+    }
+}
+
+/* =============================================================================
  * WriteBackReverse
  *
  * Transfer the data in the log its ultimate location.
@@ -356,21 +484,39 @@ static __inline__ void WriteBackReverse(Log *k)
 }
 
 /* =============================================================================
+ * FindFirst
+ *
+ * Search for first log entry that contains lock.
+ * =============================================================================
+ */
+static __inline__ AVPair *FindFirst(Log *k, volatile vwLock *Lock)
+{
+    AVPair *e;
+    AVPair *const End = k->put;
+    for (e = k->List; e != End; e = e->Next)
+    {
+        if (e->LockFor == Lock)
+        {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* =============================================================================
  * backoff
  * =============================================================================
  */
 static __inline__ void backoff(Thread *Self, long attempt)
 {
-    unsigned long long stall = 1;
-    MarsagliaXOR(&Self->rng) & 0xF;
+    unsigned long long stall = MarsagliaXOR(&Self->rng) & 0xF;
     stall += attempt >> 2;
     stall *= 10;
 
     /* CCM: timer function may misbehave */
-    volatile typeof(stall) i = 0;
+    volatile unsigned long long i = 0;
     while (i++ < stall)
     {
-        PAUSE();
     }
 }
 
@@ -397,7 +543,7 @@ static __inline__ void RecordStore(Log *k, volatile intptr_t *Addr, intptr_t Val
         e = ExtendList(k->tail);
         k->end = e;
     }
-    ASSERT(Addr != NULL);
+    assert(Addr != NULL);
     k->tail = e;
     k->put = e->Next;
     e->Addr = Addr;
@@ -405,6 +551,192 @@ static __inline__ void RecordStore(Log *k, volatile intptr_t *Addr, intptr_t Val
     e->LockFor = Lock;
     e->Held = 0;
     e->rdv = LOCKBIT; /* use either 0 or LOCKBIT */
+}
+
+/* =============================================================================
+ * TryFastUpdate
+ * =============================================================================
+ */
+static __inline__ long TryFastUpdate(Thread *Self)
+{
+    Log *const wr = &Self->wrSet;
+    Log *const rd = &Self->rdSet;
+    long ctr;
+    vwLock wv;
+
+    assert(Self->Mode == TTXN);
+
+    /*
+     * Consider: if the write-set is long or Self->Retries is high we
+     * could run a pre-pass and sort the write-locks by LockFor address.
+     * We could either use a separate LockRecord list (sorted) or
+     * link the write-set entries via SortedNext
+     */
+
+    /*
+     * Lock-acquisition phase ...
+     *
+     * CONSIDER: While iterating over the locks that cover the write-set
+     * track the maximum observed version# in maxv.
+     * In GV4:   wv = GVComputeWV(); ASSERT wv > maxv
+     * In GV5|6: wv = GVComputeWV(); if (maxv >= wv) wv = maxv + 2
+     * This is strictly an optimization.
+     * maxv isn't required for algorithmic correctness
+     */
+    Self->HoldsLocks = 1;
+    ctr = 1000; /* Spin budget - TUNABLE */
+    vwLock maxv = 0;
+    AVPair *p;
+
+    {
+        AVPair *const End = wr->put;
+        for (p = wr->List; p != End; p = p->Next)
+        {
+            volatile vwLock *const LockFor = p->LockFor;
+            vwLock cv;
+            assert(p->Addr != NULL);
+            assert(p->LockFor != NULL);
+            assert(p->Held == 0);
+            assert(p->Owner == Self);
+            /* Consider prefetching only when Self->Retries == 0 */
+            // prefetchw(LockFor);
+            cv = *(LockFor);
+            if ((cv & LOCKBIT) && ((AVPair *)(cv ^ LOCKBIT))->Owner == Self)
+            {
+                /* CCM: revalidate read because could be a hash collision */
+                if (FindFirst(rd, LockFor) != NULL)
+                {
+                    if (((AVPair *)(cv ^ LOCKBIT))->rdv > Self->rv)
+                    {
+                        Self->abv = cv;
+                        return 0;
+                    }
+                }
+                /* Already locked by an earlier iteration. */
+                continue;
+            }
+
+            /* SIGTM does not maintain a read set */
+            if (FindFirst(rd, LockFor) != NULL)
+            {
+                /*
+                 * READ-WRITE stripe
+                 */
+                if ((cv & LOCKBIT) == 0 &&
+                    cv <= Self->rv &&
+                    ((uintptr_t)(CAS(LockFor, cv, ((uintptr_t)(p) | (uintptr_t)(LOCKBIT))))) == (uintptr_t)(cv))
+                {
+                    if (cv > maxv)
+                    {
+                        maxv = cv;
+                    }
+                    p->rdv = cv;
+                    p->Held = 1;
+                    continue;
+                }
+                /*
+                 * The stripe is either locked or the previously observed read-
+                 * version changed.  We must abort. Spinning makes little sense.
+                 * In theory we could spin if the read-version is the same but
+                 * the lock is held in the faint hope that the owner might
+                 * abort and revert the lock
+                 */
+                Self->abv = cv;
+                return 0;
+            }
+            else
+            {
+                /*
+                 * WRITE-ONLY stripe
+                 * Note that we already have a fresh copy of *LockFor in cv.
+                 * If we find a write-set element locked then we can either
+                 * spin or try to find something useful to do, such as :
+                 * A. Validate the read-set by calling ReadSetCoherent()
+                 *    We can abort earlier if the transaction is doomed.
+                 * B. optimistically proceed to the next element in the write-set.
+                 *    Skip the current locked element and advance to the
+                 *    next write-set element, later retrying the skipped elements
+                 */
+
+                long c = ctr;
+
+                for (;;)
+                {
+                    cv = *(LockFor);
+                    /* CCM: for SIGTM, this IF and its true path need to be "atomic" */
+                    if ((cv & LOCKBIT) == 0 &&
+                        (uintptr_t)(CAS(LockFor, cv, ((uintptr_t)(p) | (uintptr_t)(LOCKBIT)))) == (uintptr_t)(cv))
+                    {
+                        if (cv > maxv)
+                        {
+                            maxv = cv;
+                        }
+                        p->rdv = cv; /* save so we can restore or increment */
+                        p->Held = 1;
+                        break;
+                    }
+                    if (--c < 0)
+                    {
+                        /* Will fall through to TxAbort */
+                        return 0;
+                    }
+                    /*
+                     * Consider: while spinning we might validate
+                     * the read-set by calling ReadSetCoherent()
+                     */
+                }
+            } /* write-only stripe */
+        }     /* foreach (entry in write-set) */
+    }
+
+    wv = GVGenerateWV(Self, maxv);
+
+    /*
+     * We now hold all the locks for RW and W objects.
+     * Next we validate that the values we've fetched from pure READ objects
+     * remain coherent.
+     *
+     * If GVGenerateWV() is implemented as a simplistic atomic fetch-and-add
+     * then we can optimize by skipping read-set validation in the common-case.
+     * Namely,
+     *   if (Self->rv != (wv-2) && !ReadSetCoherent(Self)) { ... abort ... }
+     * That is, we could elide read-set validation for pure READ objects if
+     * there were no intervening write txns between the fetch of _GCLOCK into
+     * Self->rv in TxStart() and the increment of _GCLOCK in GVGenerateWV()
+     */
+
+    /*
+     * CCM: for SIGTM, the read filter would have triggered an abort already
+     * if the read-set was not consistent.
+     */
+    if (!ReadSetCoherent(Self))
+    {
+        /*
+         * The read-set is inconsistent.
+         * The transaction is spoiled as the read-set is stale.
+         * The candidate results produced by the txn and held in
+         * the write-set are a function of the read-set, and thus invalid
+         */
+        return 0;
+    }
+
+    /*
+     * We are now committed - this txn is successful.
+     */
+
+    {
+        WriteBackForward(wr); /* write-back the deferred stores */
+    }
+    DropLocks(Self, wv); /* Release locks and increment the version */
+
+    /*
+     * Ensure that all the prior STs have drained before starting the next
+     * txn.  We want to avoid the scenario where STs from "this" txn
+     * languish in the write-buffer and inadvertently satisfy LDs in
+     * a subsequent txn via look-aside into the write-buffer
+     */
+
+    return 1; /* success */
 }
 
 /* =============================================================================
@@ -430,7 +762,7 @@ void TxInitThread(Thread *t)
 
     memset(t, 0, sizeof(*t)); /* Default value for most members */
 
-    // t->rng = id + 1;
+    t->rng = (intptr_t)t + 1;
     // t->xorrng[0] = t->rng;
     t->UniqID = (tx_t)t; /* The id corresponds to the address of the thread */
 
@@ -457,6 +789,10 @@ static __inline__ void txReset(Thread *Self)
 {
     Self->Mode = TIDLE;
 
+    Self->wrSet.put = Self->wrSet.List;
+    Self->wrSet.tail = NULL;
+
+    Self->wrSet.BloomFilter = 0;
     Self->rdSet.put = Self->rdSet.List;
     Self->rdSet.tail = NULL;
 
@@ -466,27 +802,13 @@ static __inline__ void txReset(Thread *Self)
 }
 
 /* =============================================================================
- * txSterilize
- *
- * Use txSterilize() any time an object passes out of the transactional domain
- * and will be accessed solely with normal non-transactional load and store
- * operations.
+ * txCommitReset
  * =============================================================================
  */
-static void txSterilize(void *Base, size_t Length)
+static __inline__ void txCommitReset(Thread *Self)
 {
-    intptr_t *Addr = (intptr_t *)Base;
-    intptr_t *End = Addr + Length;
-    ASSERT(Addr <= End);
-    while (Addr < End)
-    {
-        volatile vwLock *Lock = PSLOCK(Addr);
-        intptr_t val = *Lock;
-        /* CCM: invalidate future readers */
-        CAS(Lock, val, (_GCLOCK & ~LOCKBIT));
-        Addr++;
-    }
-    memset(Base, (unsigned char)TL2_USE_AFTER_FREE_MARKER, Length);
+    txReset(Self);
+    Self->Retries = 0;
 }
 
 /* =============================================================================
@@ -535,9 +857,9 @@ void TxAbort(Thread *Self)
  * =============================================================================
  */
 
-int TxLoad(Thread *Self, volatile intptr_t *Addr, volatile intptr_t *target, size_t alignment)
+int TxLoad(Thread *Self, intptr_t *Addr, intptr_t *target, size_t alignment)
 {
-    ASSERT(Self->Mode == TTXN);
+    assert(Self->Mode == TTXN);
 
     /* Tx previously wrote to the location: return value from write-set */
     intptr_t msk = FILTERBITS(Addr);
@@ -547,7 +869,7 @@ int TxLoad(Thread *Self, volatile intptr_t *Addr, volatile intptr_t *target, siz
         AVPair *e;
         for (e = wr->tail; e != NULL; e = e->Prev)
         {
-            ASSERT(e->Addr != NULL);
+            assert(e->Addr != NULL);
             if (e->Addr == Addr)
             {
                 memcpy(target, &(e->Val), alignment);
@@ -592,7 +914,6 @@ void TxFreeThread(Thread *t)
 
     AtomicAdd((volatile intptr_t *)((void *)(&LocalOverflowTally)), t->LocalUndo.ovf);
 
-    AtomicAdd((volatile intptr_t *)((void *)(&StartTally)), t->Starts);
     AtomicAdd((volatile intptr_t *)((void *)(&AbortTally)), t->Aborts);
 
     // tmalloc_free(t->allocPtr);
@@ -614,14 +935,20 @@ void TxFreeThread(Thread *t)
 **/
 shared_t tm_create(size_t size, size_t align)
 {
+    printf("---------- tm_create begin ----------\n");
+    printf("Create new region, size: %zu, align: %zu\n", size, align);
     struct region *region = (struct region *)malloc(sizeof(struct region));
     if (unlikely(!region))
     {
+        printf("unlikely(!region) returned true...\n");
         return invalid_shared;
     }
+
     size_t align_alloc = align < sizeof(void *) ? sizeof(void *) : align;
+    printf("align_alloc: %zu\n", align_alloc);
     if (unlikely(posix_memalign(&(region->start), align_alloc, size) != 0))
     {
+        printf("unlikely(posix_memalign(&(region->start), align_alloc, size) != 0) returned true\n");
         free(region);
         return invalid_shared;
     }
@@ -629,6 +956,8 @@ shared_t tm_create(size_t size, size_t align)
     region->size = size;
     region->align = align;
     region->align_alloc = align_alloc;
+    printf("---------- tm_create end ----------\n");
+    printf("===================================\n\n");
     return region;
 }
 
@@ -637,9 +966,12 @@ shared_t tm_create(size_t size, size_t align)
 **/
 void tm_destroy(shared_t shared)
 {
+    printf("---------- tm_destroy begin ----------\n");
     struct region *region = (struct region *)shared;
     free(region->start);
     free(region);
+    printf("---------- tm_destroy end ----------\n");
+    printf("====================================\n\n");
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -673,22 +1005,29 @@ size_t tm_align(shared_t shared)
  * @param shared Shared memory region to start a transaction on
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
-tx_t tm_begin(shared_t shared, bool is_ro as(unused))
+tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused))
 {
+    printf("---------- tm_begin begin ----------\n");
+    printf("Create new thread\n");
     Thread *t = TxNewThread(); /* Create a new thread */
-    TxInitThread(t);           /* Initialize it */
 
-    ASSERT(t->Mode == TIDLE || t->Mode == TABORTED);
+    printf("Initialize thread\n");
+    TxInitThread(t); /* Initialize it */
+
+    assert(t->Mode == TIDLE || t->Mode == TABORTED);
     txReset(t);
 
+    printf("Sample global version clock\n");
     t->rv = GVRead(t);
-    ASSERT((t->rv & LOCKBIT) == 0);
+    assert((t->rv & LOCKBIT) == 0);
 
     t->Mode = TTXN;
 
-    ASSERT(t->LocalUndo.put == t->LocalUndo.List);
-    ASSERT(t->wrSet.put == t->wrSet.List);
+    assert(t->LocalUndo.put == t->LocalUndo.List);
+    assert(t->wrSet.put == t->wrSet.List);
 
+    printf("---------- tm_begin end ----------\n");
+    printf("==================================\n\n");
     return ((tx_t)t);
 }
 
@@ -697,31 +1036,41 @@ tx_t tm_begin(shared_t shared, bool is_ro as(unused))
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t shared, tx_t tx)
+bool tm_end(shared_t shared as(unused), tx_t tx)
 {
+    printf("---------- tm_end begin ----------\n");
     Thread *t = (Thread *)tx;
 
-    ASSERT(t->Mode == TTXN);
+    assert(t->Mode == TTXN);
 
     if (t->wrSet.put == t->wrSet.List)
     {
         /* Given TL2 the read-set is already known to be coherent. */
         txCommitReset(t);
         // tmalloc_clear(t->allocPtr);
-        tmalloc_releaseAllForward(t->freePtr, &txSterilize);
-        return 1;
+        // tmalloc_releaseAllForward(t->freePtr, &txSterilize);
+        TxFreeThread(t);
+        printf("---------- tm_end end ----------\n");
+        printf("================================\n\n");
+        return true;
     }
 
     if (TryFastUpdate(t))
     {
         txCommitReset(t);
         // tmalloc_clear(t->allocPtr);
-        tmalloc_releaseAllForward(t->freePtr, &txSterilize);
-        return 1;
+        // tmalloc_releaseAllForward(t->freePtr, &txSterilize);
+        TxFreeThread(t);
+        printf("---------- tm_end end ----------\n");
+        printf("================================\n\n");
+        return true;
     }
 
+    printf("---------- tm_end end ----------\n");
+    printf("================================\n\n");
+
     TxAbort(t);
-    return 0;
+    return false;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -734,7 +1083,8 @@ bool tm_end(shared_t shared, tx_t tx)
 **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    Thread *t = (Thread *)t;
+    printf("---------- tm_read begin ----------\n");
+    Thread *t = (Thread *)tx;
 
     size_t alignment = tm_align(shared);
     if (size % alignment != 0)
@@ -742,23 +1092,26 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         return false;
     }
 
-    void *tmp_slot = (void *)calloc(sizeof(char *), size);
+    char *tmp_slot = calloc(sizeof(char *), size);
     if (unlikely(!tmp_slot))
     {
         return false;
     }
 
     size_t number_of_items = size / alignment; // number of items we want to read
-    void *current_src_slot = source;
+    const void *current_src_slot = source;
     size_t tmp_slot_index = 0;
     int err_load = 0;
     for (size_t i = 0; i < number_of_items; i++)
     {
-        err_load = TxLoad(t, (intptr_t *)(current_src_slot), &tmp_slot[tmp_slot_index], alignment);
+        err_load = TxLoad(t, (intptr_t *)(current_src_slot), (intptr_t *)(&tmp_slot[tmp_slot_index]), alignment);
 
         if (err_load == -1)
         {
             free(tmp_slot);
+            printf("error in TxLoad\n");
+            printf("---------- tm_read end ----------\n");
+            printf("=================================\n\n");
             return false;
         }
 
@@ -766,8 +1119,11 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         current_src_slot = alignment + (char *)current_src_slot;
         tmp_slot_index += alignment;
     }
-    memcopy(target, tmp_slot, size);
+    memcpy(target, tmp_slot, size);
     free(tmp_slot);
+
+    printf("---------- tm_read end ----------\n");
+    printf("=================================\n\n");
     return true;
 }
 
@@ -781,42 +1137,47 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 **/
 bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
+    printf("---------- tm_write begin ----------\n");
     volatile vwLock *LockFor;
     vwLock rdv;
 
-    ASSERT(tx->Mode == TTXN);
+    Thread *t = (Thread *)tx;
+    assert(t->Mode == TTXN);
 
-    LockFor = PSLOCK(addr);
+    LockFor = PSLOCK(target);
     rdv = *(LockFor);
 
-    Log *wr = &tx->wrSet;
+    Log *wr = &t->wrSet;
 
     if (memcmp(target, source, size) == 0)
     {
         AVPair *e;
         for (e = wr->tail; e != NULL; e = e->Prev)
         {
-            ASSERT(e->Addr != NULL);
+            assert(e->Addr != NULL);
             if (e->Addr == target)
             {
-                ASSERT(LockFor == e->LockFor);
-                memcopy(e->Val, source, size); /* update associated value in write-set */
+                assert(LockFor == e->LockFor);
+                memcpy((void *)(e->Val), source, size); /* update associated value in write-set */
                 return true;
             }
         }
         /* Not writing new value; convert to load */
-        if ((rdv & LOCKBIT) == 0 && rdv <= tx->rv && *(LockFor) == rdv)
+        if ((rdv & LOCKBIT) == 0 && rdv <= t->rv && *(LockFor) == rdv)
         {
-            if (!TrackLoad(tx, LockFor))
+            if (!TrackLoad(t, LockFor))
             {
-                TxAbort(tx);
+                TxAbort(t);
             }
             return true;
         }
     }
 
-    wr->BloomFilter |= FILTERBITS(addr);
-    RecordStore(wr, addr, valu, LockFor);
+    wr->BloomFilter |= FILTERBITS(target);
+    RecordStore(wr, target, e->val, LockFor);
+
+    printf("---------- tm_write end ----------\n");
+    printf("==================================\n\n");
     return true;
 }
 
