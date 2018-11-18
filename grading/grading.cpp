@@ -1427,11 +1427,11 @@ int main(int argc, char **argv)
             dynamic = false;
         }
         auto const nbworkers = []() {
+        	// return 1;
             auto res = ::std::thread::hardware_concurrency();
             if (unlikely(res == 0))
                 res = 16;
-            // return static_cast<size_t>(res);
-            return 1;
+            return static_cast<size_t>(res);
         }();
         auto const nbtxperwrk = 400000ul / nbworkers;
         auto const nbaccounts = 32 * nbworkers;
@@ -1442,7 +1442,8 @@ int main(int argc, char **argv)
         auto const nbrepeats = 7;
         auto const seed = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res = Chrono::get_resolution();
-        auto const slow_factor = 2ul; // TO be changed
+        // auto const slow_factor = 2ul; // TO be changed
+        auto const slow_factor = 1000ul; // TO be changed
         ::std::cout << "⎧ #worker threads:     " << nbworkers << ::std::endl;
         ::std::cout << "⎪ #TX per worker:      " << nbtxperwrk << ::std::endl;
         ::std::cout << "⎪ #repetitions:        " << nbrepeats << ::std::endl;
