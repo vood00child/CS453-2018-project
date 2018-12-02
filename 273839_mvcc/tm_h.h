@@ -35,10 +35,10 @@ enum tl2_config
   TL2_INIT_CURPOINT_NUM_ENTRY = 102400,
 };
 
-struct lock_t
+typedef struct lock_t
 {
   atomic_bool locked; // Whether the lock is taken
-};
+} lock_t;
 
 /* Read-set and write-set log entry */
 typedef struct _AVPair
@@ -47,11 +47,9 @@ typedef struct _AVPair
   struct _AVPair *Prev;
   volatile intptr_t *Addr;
   intptr_t Val;
-  volatile uintptr_t *LockFor; /* points to the uintptr_t covering Addr */
-  uintptr_t rdv;               /* read-version at time of 1st read observed */
   struct _Thread *Owner;
   int Held;
-  long Ordinal; /* local index of the entry */
+  long Index;
 } AVPair;
 
 /* Read-set and write-set log */
@@ -65,13 +63,14 @@ typedef struct _Log
   BitMap BloomFilter; /* Address exclusion fast-path test */
 } Log;
 
-typdef struct _Object
+typedef struct _Object
 {
   struct _Object *Next;
   struct _Object *Prev;
   intptr_t Val;
   bool isLocked;
   uintptr_t version;
+  long Ordinal;
 } Object;
 
 typedef struct _ListObject
@@ -91,7 +90,6 @@ struct _Thread
   bool isRO;
   Log rdSet;
   Log wrSet;
-  size_t alignment;
 };
 
 typedef struct _Thread Thread;
