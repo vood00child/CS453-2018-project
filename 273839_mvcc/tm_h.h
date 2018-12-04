@@ -47,7 +47,6 @@ typedef struct _AVPair
   struct _AVPair *Prev;
   volatile intptr_t *Addr;
   intptr_t Val;
-  struct _Thread *Owner;
   int Held;
   long Index;
 } AVPair;
@@ -98,6 +97,7 @@ typedef struct
 {
   bool isLocked;
   uintptr_t version;
+  struct _Thread *Owner;
 } shared_memory_state;
 
 struct region
