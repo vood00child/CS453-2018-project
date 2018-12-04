@@ -30,9 +30,9 @@ typedef int BitMap;
 
 enum tl2_config
 {
-  TL2_INIT_WRSET_NUM_ENTRY = 1024,
-  TL2_INIT_RDSET_NUM_ENTRY = 8192,
-  TL2_INIT_CURPOINT_NUM_ENTRY = 102400,
+  TL2_INIT_WRSET_NUM_ENTRY = 512,
+  TL2_INIT_RDSET_NUM_ENTRY = 4096,
+  INIT_NUM_VERSION = 102400,
 };
 
 typedef struct lock_t
@@ -99,6 +99,14 @@ typedef struct
   uintptr_t version;
   struct _Thread *Owner;
 } shared_memory_state;
+
+typedef struct
+{
+  bool isLocked;
+  uintptr_t version;
+  struct _Thread *Owner;
+  long Index;
+} saved_memory_state;
 
 struct region
 {

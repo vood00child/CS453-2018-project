@@ -1,6 +1,6 @@
 /**
  * @file   tm.c
- * @author [...]
+ * @author Mathieu
  *
  * @section LICENSE
  *
@@ -324,6 +324,7 @@ void TxAbort(shared_t shared, Thread *Self)
             ((region->memory_state)[p->Index]).isLocked = false;
         }
     }
+    Self->HoldsLocks = 0;
 }
 
 /* =============================================================================
@@ -423,7 +424,7 @@ static __inline__ bool TxValidateRead(Thread *Self, shared_memory_state oj_state
  * =============================================================================
  */
 
-int TxLoad(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, size_t index_oj)
+int TxLoad(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, size_t index_oj, size_t start_ind_source, saved_memory_state *saved_state)
 {
     struct region *region = (struct region *)shared;
 
@@ -441,12 +442,18 @@ int TxLoad(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, size
             if (e->Addr == Addr)
             {
                 memcpy(target, &(e->Val), region->align);
+                saved_state[index_oj - start_ind_source].Index = -1;
                 return 0;
             }
         }
     }
 
     shared_memory_state oj_state = (region->memory_state)[index_oj];
+    saved_state[index_oj - start_ind_source].version = oj_state.version;
+    saved_state[index_oj - start_ind_source].isLocked = oj_state.isLocked;
+    saved_state[index_oj - start_ind_source].Owner = oj_state.Owner;
+    saved_state[index_oj - start_ind_source].Index = index_oj;
+
     /* Tx has not been written to the location */
     if (TxValidateRead(Self, oj_state))
     {
@@ -495,19 +502,18 @@ int TxStore(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, siz
 static __inline__ long TxCommit(shared_t shared, Thread *Self)
 {
     struct region *region = (struct region *)shared;
-
     Log *const wr = &Self->wrSet;
     Log *const rd = &Self->rdSet;
     Self->HoldsLocks = 1;
     AVPair *const End_wr = wr->put;
+
     for (AVPair *p = wr->List; p != End_wr; p = p->Next)
     {
         long ind_oj = p->Index;
         if (((region->memory_state)[ind_oj]).isLocked)
         {
-            printf("ABORTING (oj already locked)\n");
+            printf("aborting (oj already locked)\n");
             fflush(stdout);
-            TxAbort(shared, Self);
             return 0;
         }
         ((region->memory_state)[ind_oj]).isLocked = true;
@@ -521,7 +527,7 @@ static __inline__ long TxCommit(shared_t shared, Thread *Self)
         long ind_oj = p->Index;
         if (!TxValidateRead(Self, (region->memory_state)[ind_oj]))
         {
-            printf("ABORTING (validate read failed)\n");
+            printf("aborting (validate read failed)\n");
             fflush(stdout);
             return 0;
         }
@@ -559,7 +565,6 @@ void TxFreeThread(Thread *t)
 {
     FreeListAVPair(&(t->rdSet), TL2_INIT_RDSET_NUM_ENTRY);
     FreeListAVPair(&(t->wrSet), TL2_INIT_WRSET_NUM_ENTRY);
-
     free(t);
 }
 
@@ -599,6 +604,7 @@ shared_t tm_create(size_t size, size_t align)
     region->align = align;
     region->align_alloc = align_alloc;
     region->VClock = 0;
+    region->timeLock.locked = false;
 
     shared_memory_state *memory_state = (shared_memory_state *)calloc(nb_objects, sizeof(shared_memory_state));
     if (unlikely(!memory_state))
@@ -617,7 +623,7 @@ shared_t tm_create(size_t size, size_t align)
     region->weakRef = (ListObject *)calloc(nb_objects, sizeof(ListObject));
     for (size_t i = 0; i < nb_objects; i++)
     {
-        (region->weakRef[i]).List = MakeListObject(TL2_INIT_CURPOINT_NUM_ENTRY);
+        (region->weakRef[i]).List = MakeListObject(INIT_NUM_VERSION);
         (region->weakRef[i]).put = (region->weakRef[i]).List;
         (region->weakRef[i]).tail = NULL;
 
@@ -632,14 +638,12 @@ shared_t tm_create(size_t size, size_t align)
 **/
 void tm_destroy(shared_t shared)
 {
-    printf("\n\n---------- tm_destroy ----------\n\n");
-    // printf("Destroy region\n");
     struct region *region = (struct region *)shared;
     size_t nb_objects = tm_size(shared) / tm_align(shared);
     free(region->start);
     for (size_t i = 0; i < nb_objects; i++)
     {
-        FreeListObject(&region->weakRef[i], TL2_INIT_CURPOINT_NUM_ENTRY);
+        FreeListObject(&region->weakRef[i], INIT_NUM_VERSION);
     }
     free(region->weakRef);
     free(region->memory_state);
@@ -680,28 +684,22 @@ size_t tm_align(shared_t shared)
 **/
 tx_t tm_begin(shared_t shared, bool is_ro)
 {
-    // printf("\n\n---------- tm_begin ----------\n");
     struct region *region = (struct region *)shared;
-    // printf("Create new thread\n");
     Thread *t = TxNewThread(); /* Create a new thread */
 
-    // printf("Initialize thread\n");
     TxInitThread(t); /* Initialize it */
     TxReset(t);
 
-    // printf("Sample global version clock\n");
     if (unlikely(!lock_acquire(&(region->timeLock))))
     {
         //TODO release locks
         ASSERT(2 == 1);
-        return 0;
+        return invalid_tx;
     }
-    t->startTime = (uintptr_t)region->VClock;
-    // t->startTime = atomic_load(&(((struct region *)shared)->VClock));
-    lock_release(&(region->timeLock));
 
+    t->startTime = (uintptr_t)region->VClock;
+    lock_release(&(region->timeLock));
     t->isRO = is_ro;
-    // printf("Global version clock: %" PRIxPTR "\n", (uintptr_t)t->rv);
 
     ASSERT(t->wrSet.put == t->wrSet.List);
 
@@ -720,19 +718,22 @@ bool tm_end(shared_t shared, tx_t tx)
     Thread *t = (Thread *)tx;
 
     // We have written nothing
+    printf("try to commit (written nothing)\n");
     if (t->wrSet.put == t->wrSet.List)
     {
         TxFreeThread(t);
+        printf("commit successful (written nothing)\n");
         return true;
     }
-
+    printf("try to commit\n");
     if (TxCommit(shared, t))
     {
         TxFreeThread(t);
+        printf("commit successful\n");
         return true;
     }
 
-    // printf("fail to commit\n");
+    printf("fail to commit\n");
     TxAbort(shared, t);
     TxFreeThread(t);
     return false;
@@ -749,6 +750,7 @@ bool tm_end(shared_t shared, tx_t tx)
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
     Thread *t = (Thread *)tx;
+    struct region *region = (struct region *)shared;
 
     size_t alignment = tm_align(shared);
     ASSERT(size % alignment == 0);
@@ -768,25 +770,43 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     int err_load = 0;
     size_t start_ind_source = get_start_index(shared, source);
 
+    saved_memory_state *saved_state = (saved_memory_state *)calloc(nb_items, sizeof(saved_memory_state));
+
     for (size_t ind = start_ind_source; ind < start_ind_source + nb_items; ind++)
     {
-        err_load = TxLoad(shared, t, (intptr_t *)(current_src_slot), (intptr_t *)(&tmp_slot[tmp_slot_index]), ind);
-
+        err_load = TxLoad(shared, t, (intptr_t *)(current_src_slot), (intptr_t *)(&tmp_slot[tmp_slot_index]), ind, start_ind_source, saved_state);
         if (err_load == -1)
         {
             free(tmp_slot);
+            free(saved_state);
             TxFreeThread(t);
-            // printf("error in TxLoad\n");
+            // printf("ERROR in TxLoad\n");
             return false;
         }
 
         current_src_slot += alignment;
         tmp_slot_index += alignment;
     }
+    for (size_t i = 0; i < nb_items; i++)
+    {
+        saved_memory_state memory_state = saved_state[i];
+        if (memory_state.Index != -1 && (memory_state.version != region->memory_state[memory_state.Index].version ||
+                                         memory_state.isLocked != region->memory_state[memory_state.Index].isLocked ||
+                                         memory_state.Owner != region->memory_state[memory_state.Index].Owner))
+        {
+            // printf("ERROR in saved_state\n");
+            free(tmp_slot);
+            free(saved_state);
+            TxFreeThread(t);
+            return false;
+        }
+    }
+    // printf("NO ERROR in saved_state\n");
 
     memcpy(target, tmp_slot, size);
     free(tmp_slot);
-
+    free(saved_state);
+    // printf("read sth\n");
     return true;
 }
 
@@ -819,7 +839,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         err_write = TxStore(shared, t, (intptr_t *)(current_src_slot), (intptr_t *)(current_target_slot), ind);
         if (err_write == -1)
         {
-            // printf("error in TxStore\n");
+            ASSERT(1800 == 1);
             TxFreeThread(t);
             return false;
         }
@@ -828,6 +848,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         current_src_slot += alignment;
         current_target_slot += alignment;
     }
+    // printf("written sth\n");
 
     return true;
 }

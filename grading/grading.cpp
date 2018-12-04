@@ -1427,11 +1427,11 @@ int main(int argc, char **argv)
             dynamic = false;
         }
         auto const nbworkers = []() {
-        	return 1;
-            // auto res = ::std::thread::hardware_concurrency();
-            // if (unlikely(res == 0))
-            //     res = 16;
-            // return static_cast<size_t>(res);
+        	// return 1;
+            auto res = ::std::thread::hardware_concurrency();
+            if (unlikely(res == 0))
+                res = 16;
+            return static_cast<size_t>(res);
         }();
         auto const nbtxperwrk = 400000ul / nbworkers;
         auto const nbaccounts = 32 * nbworkers;
