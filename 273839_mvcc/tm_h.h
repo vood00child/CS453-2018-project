@@ -23,9 +23,6 @@
 #define TL2_CACHE_LINE_SIZE (64)
 #endif
 
-/* CCM: misaligned address (0xFF bytes) to generate bus error / segfault */
-#define TL2_USE_AFTER_FREE_MARKER (-1)
-
 typedef int BitMap;
 
 enum tl2_config
@@ -37,7 +34,7 @@ enum tl2_config
 
 typedef struct lock_t
 {
-  atomic_bool locked; // Whether the lock is taken
+  atomic_bool locked; /* Whether the lock is taken */
 } lock_t;
 
 /* Read-set and write-set log entry */
@@ -55,11 +52,11 @@ typedef struct _AVPair
 typedef struct _Log
 {
   AVPair *List;
-  AVPair *put;        /* Insert position - cursor */
-  AVPair *tail;       /* CCM: Pointer to last valid entry */
-  AVPair *end;        /* CCM: Pointer to last entry */
-  long ovf;           /* Overflow - request to grow */
-  BitMap BloomFilter; /* Address exclusion fast-path test */
+  AVPair *put;  /* Insert position - cursor */
+  AVPair *tail; /* Pointer to last valid entry */
+  AVPair *end;  /* Pointer to last entry */
+  long ovf;     /* Overflow - request to grow */
+  BitMap BloomFilter;
 } Log;
 
 typedef struct _Object
@@ -72,20 +69,21 @@ typedef struct _Object
   long Ordinal;
 } Object;
 
+/* History version of the items in the shared memory region */
 typedef struct _ListObject
 {
   Object *List;
   Object *put;  /* Insert position - cursor */
-  Object *tail; /* CCM: Pointer to last valid entry */
-  Object *end;  /* CCM: Pointer to last entry */
+  Object *tail; /* Pointer to last valid entry */
+  Object *end;  /* Pointer to last entry */
   long ovf;     /* Overflow - request to grow */
 } ListObject;
 
 struct _Thread
 {
   tx_t UniqID;
-  volatile long HoldsLocks;     /* passed start of update */
-  volatile uintptr_t startTime; /* read version number */
+  volatile long HoldsLocks;
+  volatile uintptr_t startTime;
   bool isRO;
   Log rdSet;
   Log wrSet;
@@ -110,24 +108,20 @@ typedef struct
 
 struct region
 {
-  shared_memory_state *memory_state;
-  ListObject *weakRef;
-  atomic_uint VClock;
-  struct lock_t timeLock; // Global lock
-  void *start;            // Start of the shared memory region
-  size_t size;            // Size of the shared memory region (in bytes)
-  size_t align;           // Claimed alignment of the shared memory region (in bytes)
-  size_t align_alloc;     // Actual alignment of the memory allocations (in bytes)
+  shared_memory_state *memory_state; /* State of each items in the shared memory region */
+  ListObject *weakRef;               /* History version of the items in the shared memory region */
+  atomic_uint VClock;                /* Global clock */
+  struct lock_t timeLock;            /* Global lock */
+  void *start;                       /* Start of the shared memory region */
+  size_t size;                       /* Size of the shared memory region (in bytes) */
+  size_t align;                      /* Claimed alignment of the shared memory region (in bytes) */
+  size_t align_alloc;                /* Actual alignment of the memory allocations (in bytes) */
 };
 
 /*
  * We use a degenerate Bloom filter with only one hash function generating
- * a single bit.  A traditional Bloom filter use multiple hash functions and
- * multiple bits.  Relatedly, the size our filter is small, so it can saturate
- * and become useless with a rather small write-set.
- * A better solution might be small per-thread hash tables keyed by address that
- * point into the write-set.
- * Beware that 0x1F == (MIN(sizeof(int),sizeof(intptr_t))*8)-
+ * a single bit. A traditional Bloom filter use multiple hash functions and
+ * multiple bits.
  */
 
 #define FILTERHASH(a) (((uintptr_t)(a) >> 2) ^ ((uintptr_t)(a) >> 5))

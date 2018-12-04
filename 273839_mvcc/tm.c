@@ -1,6 +1,6 @@
 /**
  * @file   tm.c
- * @author Mathieu
+ * @author Mathieu Ducroux
  *
  * @section LICENSE
  *
@@ -110,7 +110,11 @@ static void lock_release(struct lock_t *lock)
     atomic_store_explicit(&(lock->locked), false, memory_order_release);
 }
 
-size_t get_start_index(shared_t shared, char const *mem_ptr)
+/** Get the index in the shared memory region of the item pointed by mem_ptr
+ * @param shared Shared memory region associated with the transaction
+ * @param mem_ptr Memory location
+**/
+size_t get_index(shared_t shared, char const *mem_ptr)
 {
     size_t alignment = tm_align(shared);
     char *start = (char *)tm_start(shared);
@@ -118,16 +122,9 @@ size_t get_start_index(shared_t shared, char const *mem_ptr)
     return start_index;
 }
 
-// -------------------------------------------------------------------------- //
-
-/* =============================================================================
- * MakeList AVPair
- *
- * Allocate the primary list as a large chunk so we can guarantee ascending &
- * adjacent addresses through the list. This improves D$ and DTLB behavior.
- * =============================================================================
- */
-
+/** Allocate an AVPair list as a large chunk
+ * @param sz Size of the list we initialize
+**/
 static __inline__ AVPair *MakeListAVPair(long sz)
 {
     AVPair *ap = (AVPair *)malloc((sizeof(*ap) * sz) + TL2_CACHE_LINE_SIZE);
@@ -148,14 +145,9 @@ static __inline__ AVPair *MakeListAVPair(long sz)
     return List;
 }
 
-/* =============================================================================
- * MakeList Object
- *
- * Allocate the primary list as a large chunk so we can guarantee ascending &
- * adjacent addresses through the list. This improves D$ and DTLB behavior.
- * =============================================================================
- */
-
+/** Allocate an Object list as a large chunk
+ * @param sz Size of the list we initialize
+**/
 static __inline__ Object *MakeListObject(long sz)
 {
     Object *oj = (Object *)malloc((sizeof(*oj) * sz) + TL2_CACHE_LINE_SIZE);
@@ -179,14 +171,11 @@ static __inline__ Object *MakeListObject(long sz)
     return List;
 }
 
-/* =============================================================================
- * FreeList AVPair
- * =============================================================================
- */
-void FreeListAVPair(Log *, long) __attribute__((noinline));
-/*__INLINE__*/ void FreeListAVPair(Log *k, long sz as(unused))
+/** Free an AVPair list
+ * @param sz Size of the list we initialize at the beginning
+**/
+void FreeListAVPair(Log *k, long sz as(unused))
 {
-    // /* Free appended overflow entries first */
     // AVPair *e = k->end;
     // if (e != NULL)
     // {
@@ -198,18 +187,14 @@ void FreeListAVPair(Log *, long) __attribute__((noinline));
     //     }
     // }
 
-    /* Free continguous beginning */
     free(k->List);
 }
 
-/* =============================================================================
- * FreeList Object
- * =============================================================================
- */
-void FreeListObject(ListObject *, long) __attribute__((noinline));
-/*__INLINE__*/ void FreeListObject(ListObject *k, long sz as(unused))
+/** Free an Object list
+ * @param sz Size of the list we initialize at the beginning
+**/
+void FreeListObject(ListObject *k, long sz as(unused))
 {
-    // /* Free appended overflow entries first */
     // Object *e = k->end;
     // if (e != NULL)
     // {
@@ -221,14 +206,15 @@ void FreeListObject(ListObject *, long) __attribute__((noinline));
     //     }
     // }
 
-    /* Free continguous beginning */
     free(k->List);
 }
 
-/* =============================================================================
- * AppendWeakReference
- * =============================================================================
- */
+/** Append a weak reference into the history of a shared item
+ * @param shared Shared memory region associated with the transaction
+ * @param ind_oj The index of the object we want to record
+ * @param source Source address pointing to the value we want to record
+ * @param version The version associated with the object
+**/
 static __inline__ int AppendWeakReference(shared_t shared, size_t ind_oj, char *source, uintptr_t version)
 {
     struct region *region = (struct region *)shared;
@@ -238,13 +224,9 @@ static __inline__ int AppendWeakReference(shared_t shared, size_t ind_oj, char *
     if (oj == NULL)
     {
         ASSERT(1 == 0);
-        // if (!ReadSetCoherentPessimistic(Self))
-        // {
-        //     return 0;
-        // }
-        // k->ovf++;
-        // e = ExtendList(k->tail);
-        // k->end = e;
+        // lo->ovf++;
+        // oj = ExtendList(lo->tail);
+        // lo->end = oj;
     }
 
     lo->tail = oj;
@@ -254,13 +236,8 @@ static __inline__ int AppendWeakReference(shared_t shared, size_t ind_oj, char *
     return 1;
 }
 
-// -------------------------------------------------------------------------- //
-
-/* =============================================================================
- * TxNewThread: Allocate a new thread-local transaction object
- * =============================================================================
- */
-
+/** Allocate a new thread-local transaction object
+**/
 Thread *TxNewThread()
 {
     Thread *t = (Thread *)malloc(sizeof(Thread));
@@ -268,49 +245,36 @@ Thread *TxNewThread()
     return t;
 }
 
-/* =============================================================================
- * TxInitThread: Initialize the transaction object
- * =============================================================================
- */
+/** Initialize the transaction object
+ * @param t The transaction object we initialize
+**/
 void TxInitThread(Thread *t)
 {
-    memset(t, 0, sizeof(*t)); /* Default value for most members */
+    memset(t, 0, sizeof(*t));
 
-    t->UniqID = (tx_t)t; /* The id corresponds to the address of the thread */
+    t->UniqID = (tx_t)t;
 
     t->wrSet.List = MakeListAVPair(TL2_INIT_WRSET_NUM_ENTRY);
     t->wrSet.put = t->wrSet.List;
+    t->wrSet.tail = NULL;
 
     t->rdSet.List = MakeListAVPair(TL2_INIT_RDSET_NUM_ENTRY);
     t->rdSet.put = t->rdSet.List;
+    t->rdSet.tail = NULL;
+
+    t->HoldsLocks = 0;
 }
 
-/* =============================================================================
- * TxReset
- * =============================================================================
- */
-static __inline__ void TxReset(Thread *Self)
-{
-    Self->wrSet.put = Self->wrSet.List;
-    Self->wrSet.tail = NULL;
-
-    Self->rdSet.put = Self->rdSet.List;
-    Self->rdSet.tail = NULL;
-
-    Self->HoldsLocks = 0;
-}
-
-/* =============================================================================
- * TxAbort
- * =============================================================================
- */
-void TxAbort(shared_t shared, Thread *Self)
+/** Release the locks held by the transaction
+ * @param shared Shared memory region associated with the transaction
+ * @param self The transaction object
+**/
+void TxAbort(shared_t shared, Thread *self)
 {
     struct region *region = (struct region *)shared;
-    if (Self->HoldsLocks)
+    if (self->HoldsLocks)
     {
-        printf("Restore locks\n");
-        Log *wr = &Self->wrSet;
+        Log *wr = &self->wrSet;
 
         AVPair *p;
         AVPair *const End = wr->put;
@@ -324,44 +288,21 @@ void TxAbort(shared_t shared, Thread *Self)
             ((region->memory_state)[p->Index]).isLocked = false;
         }
     }
-    Self->HoldsLocks = 0;
+    self->HoldsLocks = 0;
 }
 
-/* =============================================================================
- * TrackLoad
- * =============================================================================
- */
-static __inline__ int TrackLoad(Thread *Self, size_t index_oj)
+/** Record the load in the read set
+ * @param self The transaction object
+ * @param index_oj The index of the object we want to record
+**/
+static __inline__ int RecordLoad(Thread *self, size_t index_oj)
 {
-    Log *k = &(Self->rdSet);
-
-    /*
-     * Consider collapsing back-to-back track loads ...
-     * if the previous LockFor and rdv match the incoming arguments then
-     * simply return
-     */
-
-    /*
-     * Read log overflow suggests a rogue or incoherent transaction.
-     * Consider calling SpeculativeReadSetCoherent() and, if needed, TxAbort().
-     * This lets us distinguish between a doomed txn that's gone rogue
-     * and a large transaction that legitimately overflows the buffer.
-     * In the latter case we might extend the buffer or chain an overflow
-     * buffer onto "k".
-     * Options: print, abort, panic, extend, ignore & discard
-     * Beware of inlining effects - TrackLoad() is performance-critical.
-     * Decreasing the sample period tunable in TxValid() will reduce the
-     * rate of overflows caused by zombie transactions.
-     */
+    Log *k = &(self->rdSet);
 
     AVPair *e = k->put;
     if (e == NULL)
     {
-        ASSERT(64 == 0);
-        // if (!ReadSetCoherentPessimistic(Self))
-        // {
-        //     return 0;
-        // }
+        ASSERT(0 == 1); // should not happen (means rd list overflows)
         // k->ovf++;
         // e = ExtendList(k->tail);
         // k->end = e;
@@ -371,75 +312,69 @@ static __inline__ int TrackLoad(Thread *Self, size_t index_oj)
     k->put = e->Next;
     e->Index = index_oj;
     e->Held = 0;
-    /* Note that Val and Addr fields are undefined for tracked loads */
 
     return 1;
 }
 
-/* =============================================================================
- * RecordStore
- * =============================================================================
- */
-static __inline__ void RecordStore(Log *k, intptr_t *Addr, intptr_t *target, size_t index_oj, size_t alignment)
+/** Record the store in the write set
+ * @param self The transaction object
+ * @param source Source start address (in a private region)
+ * @param target Target start address (in the shared region)
+ * @param index_oj The index of the object we want to record
+ * @param alignment The number of bytes we want to copy
+**/
+static __inline__ void RecordStore(Thread *self, intptr_t *source, intptr_t *target, size_t index_oj, size_t alignment)
 {
-    /*
-     * As an optimization we could squash multiple stores to the same location.
-     * Maintain FIFO order to avoid WAW hazards.
-     * TODO-FIXME - CONSIDER
-     * Keep Self->LockSet as a sorted linked list of unique LockFor addresses.
-     * We'd scan the LockSet for Lock.  If not found we'd insert a new
-     * LockRecord at the appropriate location in the list.
-     * Call InsertIfAbsent (Self, LockFor)
-     */
+    Log *k = &(self->wrSet);
+
     AVPair *e = k->put;
     if (e == NULL)
     {
-        ASSERT(64 == 12);
-        // printf("wr list overflow\n");
+        ASSERT(0 == 1); // should not happen (means wr list overflows)
         // k->ovf++;
         // e = ExtendList(k->tail);
         // k->end = e;
     }
-    ASSERT(Addr != NULL);
     k->tail = e;
     k->put = e->Next;
     e->Addr = target;
-    memcpy(&(e->Val), Addr, alignment);
+    memcpy(&(e->Val), source, alignment);
     e->Index = index_oj;
     e->Held = 0;
 }
 
-/* =============================================================================
- * TxValidateRead
- * =============================================================================
- */
-
-static __inline__ bool TxValidateRead(Thread *Self, shared_memory_state oj_state)
+/** Check if an item in shared memory can be read
+ * @param self The transaction object
+ * @param oj_state The state of the object
+**/
+static __inline__ bool TxValidateRead(Thread *self, shared_memory_state oj_state)
 {
-    return (!oj_state.isLocked || oj_state.Owner == Self) && (oj_state.version <= Self->startTime);
+    return (!oj_state.isLocked || oj_state.Owner == self) && (oj_state.version <= self->startTime);
 }
 
-/* =============================================================================
- * TxLoad
- * =============================================================================
- */
-
-int TxLoad(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, size_t index_oj, size_t start_ind_source, saved_memory_state *saved_state)
+/** Load a single item in a private region
+ * @param shared Shared memory region associated with the transaction
+ * @param self The transaction object
+ * @param source Source start address (in the shared region)
+ * @param target Target start address (in a private region)
+ * @param index_oj The index of the object we want to record
+ * @param start_ind_source The index of the first item we want the read in tm_read
+ * @param saved_state The state of the items just before reading them
+**/
+int TxLoad(shared_t shared, Thread *self, intptr_t *source, intptr_t *target, size_t index_oj, size_t start_ind_source, saved_memory_state *saved_state)
 {
     struct region *region = (struct region *)shared;
 
-    // if (!Self->isRO)
-    // {
     /* Tx previously wrote to the location: return value from write-set */
-    intptr_t msk = FILTERBITS(Addr);
-    if ((Self->wrSet.BloomFilter & msk) == msk)
+    intptr_t msk = FILTERBITS(source);
+    if ((self->wrSet.BloomFilter & msk) == msk)
     {
-        Log *wr = &(Self->wrSet);
+        Log *wr = &(self->wrSet);
         AVPair *e;
         for (e = wr->tail; e != NULL; e = e->Prev)
         {
             ASSERT(e->Addr != NULL);
-            if (e->Addr == Addr)
+            if (e->Addr == source)
             {
                 memcpy(target, &(e->Val), region->align);
                 saved_state[index_oj - start_ind_source].Index = -1;
@@ -455,32 +390,34 @@ int TxLoad(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, size
     saved_state[index_oj - start_ind_source].Index = index_oj;
 
     /* Tx has not been written to the location */
-    if (TxValidateRead(Self, oj_state))
+    if (TxValidateRead(self, oj_state))
     {
-        if (!TrackLoad(Self, index_oj))
+        if (!RecordLoad(self, index_oj))
         {
-            TxAbort(shared, Self);
+            TxAbort(shared, self);
         }
-        memcpy(target, Addr, region->align);
+        memcpy(target, source, region->align);
         return 0;
     }
 
-    TxAbort(shared, Self);
+    TxAbort(shared, self);
     return -1;
-    // }
 }
 
-/* =============================================================================
- * TxStore
- * =============================================================================
- */
-int TxStore(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, size_t index_oj)
+/** Store a single item in the write set
+ * @param shared Shared memory region associated with the transaction
+ * @param self The transaction object
+ * @param source Source start address (in a private region)
+ * @param target Target start address (in the shared region)
+ * @param index_oj The index of the object we want to record
+**/
+int TxStore(shared_t shared, Thread *self, intptr_t *source, intptr_t *target, size_t index_oj)
 {
     struct region *region = (struct region *)shared;
-    Log *wr = &Self->wrSet;
+    Log *wr = &self->wrSet;
 
     intptr_t msk = FILTERBITS(target);
-    if ((Self->wrSet.BloomFilter & msk) == msk)
+    if ((self->wrSet.BloomFilter & msk) == msk)
     {
         AVPair *e;
         for (e = wr->tail; e != NULL; e = e->Prev)
@@ -488,23 +425,27 @@ int TxStore(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, siz
             ASSERT(e->Addr != NULL);
             if (e->Addr == target)
             {
-                memcpy(&(e->Val), Addr, region->align);
+                memcpy(&(e->Val), source, region->align);
                 return 0;
             }
         }
     }
 
     wr->BloomFilter |= FILTERBITS(target);
-    RecordStore(wr, Addr, target, index_oj, region->align);
+    RecordStore(self, source, target, index_oj, region->align);
     return 0;
 }
 
-static __inline__ long TxCommit(shared_t shared, Thread *Self)
+/** Commit the changes made locally by a given transaction
+ * @param shared Shared memory region associated with the transaction
+ * @param self The transaction object
+**/
+static __inline__ long TxCommit(shared_t shared, Thread *self)
 {
     struct region *region = (struct region *)shared;
-    Log *const wr = &Self->wrSet;
-    Log *const rd = &Self->rdSet;
-    Self->HoldsLocks = 1;
+    Log *const wr = &self->wrSet;
+    Log *const rd = &self->rdSet;
+    self->HoldsLocks = 1;
     AVPair *const End_wr = wr->put;
 
     for (AVPair *p = wr->List; p != End_wr; p = p->Next)
@@ -512,12 +453,10 @@ static __inline__ long TxCommit(shared_t shared, Thread *Self)
         long ind_oj = p->Index;
         if (((region->memory_state)[ind_oj]).isLocked)
         {
-            printf("aborting (oj already locked)\n");
-            fflush(stdout);
             return 0;
         }
         ((region->memory_state)[ind_oj]).isLocked = true;
-        ((region->memory_state)[ind_oj]).Owner = Self;
+        ((region->memory_state)[ind_oj]).Owner = self;
         p->Held = 1;
     }
 
@@ -525,10 +464,8 @@ static __inline__ long TxCommit(shared_t shared, Thread *Self)
     for (AVPair *p = rd->List; p != End_rd; p = p->Next)
     {
         long ind_oj = p->Index;
-        if (!TxValidateRead(Self, (region->memory_state)[ind_oj]))
+        if (!TxValidateRead(self, (region->memory_state)[ind_oj]))
         {
-            printf("aborting (validate read failed)\n");
-            fflush(stdout);
             return 0;
         }
     }
@@ -536,7 +473,7 @@ static __inline__ long TxCommit(shared_t shared, Thread *Self)
     if (unlikely(!lock_acquire(&(region->timeLock))))
     {
         //TODO release locks
-        ASSERT(58 == 120);
+        ASSERT(0 == 1); // should not happen
         return 0;
     }
 
@@ -557,10 +494,9 @@ static __inline__ long TxCommit(shared_t shared, Thread *Self)
     return 1;
 }
 
-/* =============================================================================
- * TxFreeThread
- * =============================================================================
- */
+/** Free the transaction object
+ * @param t the transaction object we want to free
+**/
 void TxFreeThread(Thread *t)
 {
     FreeListAVPair(&(t->rdSet), TL2_INIT_RDSET_NUM_ENTRY);
@@ -577,27 +513,20 @@ void TxFreeThread(Thread *t)
 **/
 shared_t tm_create(size_t size, size_t align)
 {
-    printf("\n\n---------- tm_create ----------\n\n");
-    // TODO: tm_create(size_t, size_t)
     struct region *region = (struct region *)malloc(sizeof(struct region));
     if (unlikely(!region))
     {
-        // printf("unlikely(!region) returned true...\n");
         return invalid_shared;
     }
 
     size_t align_alloc = align < sizeof(void *) ? sizeof(void *) : align;
-    // printf("align_alloc: %zu\n", align_alloc);
     if (unlikely(posix_memalign(&(region->start), align_alloc, size) != 0))
     {
-        // printf("unlikely(posix_memalign(&(region->start), align_alloc, size) != 0) returned true\n");
         free(region);
         return invalid_shared;
     }
 
     size_t nb_objects = size / align;
-    printf("size: %zu\n", size);
-    printf("nb_obj: %zu\n", nb_objects);
 
     memset(region->start, 0, size);
     region->size = size;
@@ -685,20 +614,18 @@ size_t tm_align(shared_t shared)
 tx_t tm_begin(shared_t shared, bool is_ro)
 {
     struct region *region = (struct region *)shared;
-    Thread *t = TxNewThread(); /* Create a new thread */
+    Thread *t = TxNewThread();
 
-    TxInitThread(t); /* Initialize it */
-    TxReset(t);
+    TxInitThread(t);
 
     if (unlikely(!lock_acquire(&(region->timeLock))))
     {
-        //TODO release locks
-        ASSERT(2 == 1);
+        ASSERT(0 == 1); // should not happen
         return invalid_tx;
     }
-
     t->startTime = (uintptr_t)region->VClock;
     lock_release(&(region->timeLock));
+
     t->isRO = is_ro;
 
     ASSERT(t->wrSet.put == t->wrSet.List);
@@ -713,27 +640,22 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 **/
 bool tm_end(shared_t shared, tx_t tx)
 {
-    // printf("--- tm_end ---\n");
-    // fflush(stdout);
+
     Thread *t = (Thread *)tx;
 
-    // We have written nothing
-    printf("try to commit (written nothing)\n");
+    /* We have written nothing */
     if (t->wrSet.put == t->wrSet.List)
     {
         TxFreeThread(t);
-        printf("commit successful (written nothing)\n");
-        return true;
-    }
-    printf("try to commit\n");
-    if (TxCommit(shared, t))
-    {
-        TxFreeThread(t);
-        printf("commit successful\n");
         return true;
     }
 
-    printf("fail to commit\n");
+    if (TxCommit(shared, t))
+    {
+        TxFreeThread(t);
+        return true;
+    }
+
     TxAbort(shared, t);
     TxFreeThread(t);
     return false;
@@ -764,11 +686,11 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         return false;
     }
 
-    size_t nb_items = size / alignment; // number of items we want to read
+    size_t nb_items = size / alignment;
     const char *current_src_slot = source;
     size_t tmp_slot_index = 0;
     int err_load = 0;
-    size_t start_ind_source = get_start_index(shared, source);
+    size_t start_ind_source = get_index(shared, source);
 
     saved_memory_state *saved_state = (saved_memory_state *)calloc(nb_items, sizeof(saved_memory_state));
 
@@ -780,7 +702,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             free(tmp_slot);
             free(saved_state);
             TxFreeThread(t);
-            // printf("ERROR in TxLoad\n");
             return false;
         }
 
@@ -794,19 +715,16 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
                                          memory_state.isLocked != region->memory_state[memory_state.Index].isLocked ||
                                          memory_state.Owner != region->memory_state[memory_state.Index].Owner))
         {
-            // printf("ERROR in saved_state\n");
             free(tmp_slot);
             free(saved_state);
             TxFreeThread(t);
             return false;
         }
     }
-    // printf("NO ERROR in saved_state\n");
 
     memcpy(target, tmp_slot, size);
     free(tmp_slot);
     free(saved_state);
-    // printf("read sth\n");
     return true;
 }
 
@@ -827,28 +745,19 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     size_t alignment = tm_align(shared);
     ASSERT(size % alignment == 0);
 
-    size_t nb_items = size / alignment; // number of items we want to read
+    size_t nb_items = size / alignment;
     const char *current_src_slot = source;
     char *current_target_slot = target;
 
-    int err_write = 0;
-    size_t start_ind_source = get_start_index(shared, target);
+    size_t start_ind_source = get_index(shared, target);
 
     for (size_t ind = start_ind_source; ind < start_ind_source + nb_items; ind++)
     {
-        err_write = TxStore(shared, t, (intptr_t *)(current_src_slot), (intptr_t *)(current_target_slot), ind);
-        if (err_write == -1)
-        {
-            ASSERT(1800 == 1);
-            TxFreeThread(t);
-            return false;
-        }
+        TxStore(shared, t, (intptr_t *)(current_src_slot), (intptr_t *)(current_target_slot), ind);
 
-        // You may want to replace char* by uintptr_t
         current_src_slot += alignment;
         current_target_slot += alignment;
     }
-    // printf("written sth\n");
 
     return true;
 }
