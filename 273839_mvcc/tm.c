@@ -110,10 +110,10 @@ static void lock_release(struct lock_t *lock)
     atomic_store_explicit(&(lock->locked), false, memory_order_release);
 }
 
-size_t get_start_index(shared_t shared, void const *mem_ptr)
+size_t get_start_index(shared_t shared, char const *mem_ptr)
 {
     size_t alignment = tm_align(shared);
-    void *start = tm_start(shared);
+    char *start = (char *)tm_start(shared);
     size_t start_index = (mem_ptr - start) / alignment;
     return start_index;
 }
@@ -310,7 +310,7 @@ void TxAbort(shared_t shared, Thread *Self)
     struct region *region = (struct region *)shared;
     if (Self->HoldsLocks)
     {
-        // printf("Restore locks\n");
+        printf("Restore locks\n");
         Log *wr = &Self->wrSet;
 
         AVPair *p;
@@ -370,6 +370,7 @@ static __inline__ int TrackLoad(Thread *Self, size_t index_oj)
     k->tail = e;
     k->put = e->Next;
     e->Index = index_oj;
+    e->Held = 0;
     /* Note that Val and Addr fields are undefined for tracked loads */
 
     return 1;
@@ -433,7 +434,7 @@ int TxLoad(shared_t shared, Thread *Self, intptr_t *Addr, intptr_t *target, size
     intptr_t msk = FILTERBITS(Addr);
     if ((Self->wrSet.BloomFilter & msk) == msk)
     {
-        // printf("Value to be read already in wrSet\n");
+        printf("Value to be read already in wrSet\n");
         Log *wr = &(Self->wrSet);
         AVPair *e;
         for (e = wr->tail; e != NULL; e = e->Prev)
@@ -566,8 +567,9 @@ void TxFreeThread(Thread *t)
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
 **/
-shared_t tm_create(size_t size as(unused), size_t align as(unused))
+shared_t tm_create(size_t size, size_t align)
 {
+    printf("\n\n---------- tm_create ----------\n\n");
     // TODO: tm_create(size_t, size_t)
     struct region *region = (struct region *)malloc(sizeof(struct region));
     if (unlikely(!region))
@@ -622,9 +624,9 @@ shared_t tm_create(size_t size as(unused), size_t align as(unused))
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
 **/
-void tm_destroy(shared_t shared as(unused))
+void tm_destroy(shared_t shared)
 {
-    // printf("\n\n---------- tm_destroy ----------\n");
+    printf("\n\n---------- tm_destroy ----------\n\n");
     // printf("Destroy region\n");
     struct region *region = (struct region *)shared;
     size_t nb_objects = tm_size(shared) / tm_align(shared);
@@ -642,7 +644,7 @@ void tm_destroy(shared_t shared as(unused))
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
 **/
-void *tm_start(shared_t shared as(unused))
+void *tm_start(shared_t shared)
 {
     return ((struct region *)shared)->start;
 }
@@ -651,7 +653,7 @@ void *tm_start(shared_t shared as(unused))
  * @param shared Shared memory region to query
  * @return First allocated segment size
 **/
-size_t tm_size(shared_t shared as(unused))
+size_t tm_size(shared_t shared)
 {
     return ((struct region *)shared)->size;
 }
@@ -660,7 +662,7 @@ size_t tm_size(shared_t shared as(unused))
  * @param shared Shared memory region to query
  * @return Alignment used globally
 **/
-size_t tm_align(shared_t shared as(unused))
+size_t tm_align(shared_t shared)
 {
     return ((struct region *)shared)->align;
 }
@@ -670,7 +672,7 @@ size_t tm_align(shared_t shared as(unused))
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
-tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused))
+tx_t tm_begin(shared_t shared, bool is_ro)
 {
     // printf("\n\n---------- tm_begin ----------\n");
     struct region *region = (struct region *)shared;
@@ -688,7 +690,7 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused))
         ASSERT(2 == 1);
         return 0;
     }
-    t->startTime = region->VClock;
+    t->startTime = (uintptr_t)region->VClock;
     // t->startTime = atomic_load(&(((struct region *)shared)->VClock));
     lock_release(&(region->timeLock));
 
@@ -705,8 +707,10 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro as(unused))
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
+bool tm_end(shared_t shared, tx_t tx)
 {
+    // printf("--- tm_end ---\n");
+    // fflush(stdout);
     Thread *t = (Thread *)tx;
 
     // We have written nothing
@@ -721,6 +725,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
         TxFreeThread(t);
         return true;
     }
+
     // printf("fail to commit\n");
     TxAbort(shared, t);
     TxFreeThread(t);
@@ -735,7 +740,7 @@ bool tm_end(shared_t shared as(unused), tx_t tx as(unused))
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const *source as(unused), size_t size as(unused), void *target as(unused))
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
     Thread *t = (Thread *)tx;
 
@@ -787,7 +792,7 @@ bool tm_read(shared_t shared as(unused), tx_t tx as(unused), void const *source 
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t shared as(unused), tx_t tx as(unused), void const *source as(unused), size_t size as(unused), void *target as(unused))
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
     Thread *t = (Thread *)tx;
 
