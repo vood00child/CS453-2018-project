@@ -136,6 +136,7 @@ static __inline__ AVPair *MakeListAVPair(long sz)
         AVPair *e = ap++;
         e->Next = ap;
         e->Prev = Tail;
+        e->Ordinal = i;
         Tail = e;
     }
     Tail->Next = NULL;
@@ -169,21 +170,48 @@ static __inline__ Object *MakeListObject(long sz)
     return List;
 }
 
+static __inline__ AVPair *ExtendListAVPair(AVPair *tail)
+{
+    printf("Extend\n");
+    AVPair *e = (AVPair *)malloc(sizeof(*e));
+    ASSERT(e);
+    memset(e, 0, sizeof(*e));
+    tail->Next = e;
+    e->Prev = tail;
+    e->Next = NULL;
+    e->Ordinal = tail->Ordinal + 1;
+    /*e->Held    = 0; -- done by memset*/
+    return e;
+}
+
+static __inline__ Object *ExtendListObject(Object *tail)
+{
+    Object *e = (Object *)malloc(sizeof(*e));
+    ASSERT(e);
+    memset(e, 0, sizeof(*e));
+    tail->Next = e;
+    e->Prev = tail;
+    e->Next = NULL;
+    e->Ordinal = tail->Ordinal + 1;
+    /*e->Held    = 0; -- done by memset*/
+    return e;
+}
+
 /** Free an AVPair list
  * @param sz Size of the list we initialize at the beginning
 **/
-void FreeListAVPair(Log *k, long sz as(unused))
+void FreeListAVPair(Log *k, long sz)
 {
-    // AVPair *e = k->end;
-    // if (e != NULL)
-    // {
-    //     while (e->Ordinal >= sz)
-    //     {
-    //         AVPair *tmp = e;
-    //         e = e->Prev;
-    //         free(tmp);
-    //     }
-    // }
+    AVPair *e = k->end;
+    if (e != NULL)
+    {
+        while (e->Ordinal >= sz)
+        {
+            AVPair *tmp = e;
+            e = e->Prev;
+            free(tmp);
+        }
+    }
 
     free(k->List);
 }
@@ -191,18 +219,18 @@ void FreeListAVPair(Log *k, long sz as(unused))
 /** Free an Object list
  * @param sz Size of the list we initialize at the beginning
 **/
-void FreeListObject(ListObject *k, long sz as(unused))
+void FreeListObject(ListObject *k, long sz)
 {
-    // Object *e = k->end;
-    // if (e != NULL)
-    // {
-    //     while (e->Ordinal >= sz)
-    //     {
-    //         Object *tmp = e;
-    //         e = e->Prev;
-    //         free(tmp);
-    //     }
-    // }
+    Object *e = k->end;
+    if (e != NULL)
+    {
+        while (e->Ordinal >= sz)
+        {
+            Object *tmp = e;
+            e = e->Prev;
+            free(tmp);
+        }
+    }
 
     free(k->List);
 }
@@ -285,6 +313,7 @@ void TxAbort(shared_t shared, Thread *self)
             p->Held = 0;
             ((region->memory_state)[p->Index]).isLocked = false;
             ((region->memory_state)[p->Index]).Owner = NULL;
+            lock_release(&(((region->memory_state)[p->Index]).lock));
         }
     }
     self->HoldsLocks = 0;
@@ -301,10 +330,9 @@ static __inline__ int RecordLoad(Thread *self, size_t index_oj)
     AVPair *e = k->put;
     if (e == NULL)
     {
-        ASSERT(0 == 1); // should not happen (means rd list overflows)
-        // k->ovf++;
-        // e = ExtendList(k->tail);
-        // k->end = e;
+        // ASSERT(0 == 1); // (means rd list overflows)
+        e = ExtendListAVPair(k->tail);
+        k->end = e;
     }
 
     k->tail = e;
@@ -329,10 +357,9 @@ static __inline__ void RecordStore(Thread *self, uintptr_t *source, uintptr_t *t
     AVPair *e = k->put;
     if (e == NULL)
     {
-        ASSERT(0 == 1); // should not happen (means wr list overflows)
-        // k->ovf++;
-        // e = ExtendList(k->tail);
-        // k->end = e;
+        // ASSERT(0 == 1); // (means wr list overflows)
+        e = ExtendListAVPair(k->tail);
+        k->end = e;
     }
     k->tail = e;
     k->put = e->Next;
@@ -348,7 +375,7 @@ static __inline__ void RecordStore(Thread *self, uintptr_t *source, uintptr_t *t
 **/
 static __inline__ bool TxValidateRead(Thread *self, shared_memory_state oj_state)
 {
-    return (!oj_state.isLocked || oj_state.Owner == self) && (oj_state.version <= self->startTime); //check owner only for commit?
+    return (!oj_state.isLocked || oj_state.Owner == self) && (oj_state.version <= self->startTime);
 }
 
 /** Load a single item in a private region
@@ -450,7 +477,7 @@ static __inline__ long TxCommit(shared_t shared, Thread *self)
     for (AVPair *p = wr->List; p != End_wr; p = p->Next)
     {
         long ind_oj = p->Index;
-        if (((region->memory_state)[ind_oj]).isLocked)
+        if (!lock_acquire(&((region->memory_state)[ind_oj]).lock))
         {
             return 0;
         }
@@ -459,22 +486,21 @@ static __inline__ long TxCommit(shared_t shared, Thread *self)
         p->Held = 1;
     }
 
-    if (unlikely(!lock_acquire(&(region->timeLock))))
-    {
-        //TODO release locks
-        ASSERT(0 == 1); // should not happen
-        return 0;
-    }
-
     AVPair *const End_rd = rd->put;
     for (AVPair *p = rd->List; p != End_rd; p = p->Next)
     {
         long ind_oj = p->Index;
         if (!TxValidateRead(self, (region->memory_state)[ind_oj]))
         {
-            lock_release(&(region->timeLock));
+
             return 0;
         }
+    }
+
+    if (unlikely(!lock_acquire(&(region->timeLock))))
+    {
+        ASSERT(0 == 1); // should not happen
+        return 0;
     }
 
     region->VClock += 1;
@@ -487,6 +513,7 @@ static __inline__ long TxCommit(shared_t shared, Thread *self)
         (region->memory_state[ind_oj]).version = region->VClock;
         (region->memory_state[ind_oj]).isLocked = false;
         ((region->memory_state)[ind_oj]).Owner = NULL;
+        lock_release(&(((region->memory_state)[ind_oj]).lock));
     }
 
     lock_release(&(region->timeLock));
@@ -543,6 +570,7 @@ shared_t tm_create(size_t size, size_t align)
     }
     for (size_t i = 0; i < nb_objects; i++)
     {
+        memory_state[i].lock.locked = false;
         memory_state[i].isLocked = false;
         memory_state[i].version = 0;
         memory_state[i].Owner = NULL;

@@ -27,8 +27,8 @@ typedef int BitMap;
 
 enum tl2_config
 {
-  TL2_INIT_WRSET_NUM_ENTRY = 512,
-  TL2_INIT_RDSET_NUM_ENTRY = 4096,
+  TL2_INIT_WRSET_NUM_ENTRY = 2048,
+  TL2_INIT_RDSET_NUM_ENTRY = 8192,
   INIT_NUM_VERSION = 102400,
 };
 
@@ -45,7 +45,8 @@ typedef struct _AVPair
   volatile uintptr_t *Addr;
   intptr_t Val;
   int Held;
-  long Index; // starts at 0
+  long Index;   // starts at 0
+  long Ordinal; /* local index of the entry */
 } AVPair;
 
 /* Read-set and write-set log */
@@ -93,6 +94,7 @@ typedef struct _Thread Thread;
 
 typedef struct
 {
+  lock_t lock;
   bool isLocked;
   uintptr_t version;
   struct _Thread *Owner;
