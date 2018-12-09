@@ -42,10 +42,10 @@ typedef struct _AVPair
 {
   struct _AVPair *Next;
   struct _AVPair *Prev;
-  volatile intptr_t *Addr;
+  volatile uintptr_t *Addr;
   intptr_t Val;
   int Held;
-  long Index;
+  long Index; // starts at 0
 } AVPair;
 
 /* Read-set and write-set log */
@@ -109,13 +109,13 @@ typedef struct
 struct region
 {
   shared_memory_state *memory_state; /* State of each items in the shared memory region */
-  ListObject *weakRef;               /* History version of the items in the shared memory region */
-  atomic_uint VClock;                /* Global clock */
-  struct lock_t timeLock;            /* Global lock */
-  void *start;                       /* Start of the shared memory region */
-  size_t size;                       /* Size of the shared memory region (in bytes) */
-  size_t align;                      /* Claimed alignment of the shared memory region (in bytes) */
-  size_t align_alloc;                /* Actual alignment of the memory allocations (in bytes) */
+  // ListObject *weakRef;               /* History version of the items in the shared memory region */
+  atomic_uint VClock;     /* Global clock */
+  struct lock_t timeLock; /* Global lock */
+  void *start;            /* Start of the shared memory region */
+  size_t size;            /* Size of the shared memory region (in bytes) */
+  size_t align;           /* Claimed alignment of the shared memory region (in bytes) */
+  size_t align_alloc;     /* Actual alignment of the memory allocations (in bytes) */
 };
 
 /*
