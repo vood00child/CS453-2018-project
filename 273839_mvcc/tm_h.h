@@ -37,16 +37,52 @@ typedef struct lock_t
   atomic_bool locked; /* Whether the lock is taken */
 } lock_t;
 
+typedef struct
+{
+  lock_t lock;
+  bool isLocked;
+  uintptr_t version;
+  struct _Thread *Owner;
+} shared_memory_state;
+
+typedef struct
+{
+  bool isLocked;
+  uintptr_t version;
+  struct _Thread *Owner;
+  intptr_t Index;
+} saved_memory_state;
+
+typedef struct _States
+{
+  struct _States *Next;
+  uintptr_t from;
+  uintptr_t to;
+  shared_memory_state *memory_state; /* State of each items in the shared memory region */
+} States;
+
+struct region
+{
+  // ListObject *weakRef;               /* History version of the items in the shared memory region */
+  atomic_uint VClock;     /* Global clock */
+  struct lock_t timeLock; /* Global lock */
+  void *start;            /* Start of the shared memory region */
+  size_t size;            /* Size of the shared memory region (in bytes) */
+  size_t align;           /* Claimed alignment of the shared memory region (in bytes) */
+  size_t align_alloc;     /* Actual alignment of the memory allocations (in bytes) */
+  States *states;
+} region;
+
 /* Read-set and write-set log entry */
 typedef struct _AVPair
 {
   struct _AVPair *Next;
   struct _AVPair *Prev;
-  volatile uintptr_t *Addr;
+  uintptr_t *Addr;
   intptr_t Val;
   int Held;
-  long Index;   // starts at 0
-  long Ordinal; /* local index of the entry */
+  shared_memory_state *State; // starts at 0
+  long Ordinal;               /* local index of the entry */
 } AVPair;
 
 /* Read-set and write-set log */
@@ -91,34 +127,6 @@ struct _Thread
 };
 
 typedef struct _Thread Thread;
-
-typedef struct
-{
-  lock_t lock;
-  bool isLocked;
-  uintptr_t version;
-  struct _Thread *Owner;
-} shared_memory_state;
-
-typedef struct
-{
-  bool isLocked;
-  uintptr_t version;
-  struct _Thread *Owner;
-  long Index;
-} saved_memory_state;
-
-struct region
-{
-  shared_memory_state *memory_state; /* State of each items in the shared memory region */
-  // ListObject *weakRef;               /* History version of the items in the shared memory region */
-  atomic_uint VClock;     /* Global clock */
-  struct lock_t timeLock; /* Global lock */
-  void *start;            /* Start of the shared memory region */
-  size_t size;            /* Size of the shared memory region (in bytes) */
-  size_t align;           /* Claimed alignment of the shared memory region (in bytes) */
-  size_t align_alloc;     /* Actual alignment of the memory allocations (in bytes) */
-};
 
 /*
  * We use a degenerate Bloom filter with only one hash function generating
