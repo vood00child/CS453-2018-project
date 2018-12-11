@@ -5,21 +5,21 @@ EXT_HPP  := h hh hpp hxx h++
 EXT_C    := c
 EXT_CXX  := C cc cpp cxx c++
 
-INCLUDE_DIR := ../include
-SOURCE_DIR  := .
+INCLUDE_DIRS := ../include .
+SOURCE_DIRS  := .
 
 WILD_EXT  = $(strip $(foreach EXT,$($(1)),$(wildcard $(2)/*.$(EXT))))
 
-HDRS_C   := $(call WILD_EXT,EXT_H,$(INCLUDE_DIR))
-HDRS_CXX := $(call WILD_EXT,EXT_HPP,$(INCLUDE_DIR))
-SRCS_C   := $(call WILD_EXT,EXT_C,$(SOURCE_DIR))
-SRCS_CXX := $(call WILD_EXT,EXT_CXX,$(SOURCE_DIR))
+HDRS_C   := $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),$(call WILD_EXT,EXT_H,$(INCLUDE_DIR)))
+HDRS_CXX := $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),$(call WILD_EXT,EXT_HPP,$(INCLUDE_DIR)))
+SRCS_C   := $(foreach SOURCE_DIR,$(SOURCE_DIRS),$(call WILD_EXT,EXT_C,$(SOURCE_DIR)))
+SRCS_CXX := $(foreach SOURCE_DIR,$(SOURCE_DIRS),$(call WILD_EXT,EXT_CXX,$(SOURCE_DIR)))
 OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 
 CC       := $(CC)
-CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 -I$(INCLUDE_DIR)
+CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
 CXX      := $(CXX)
-CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++14 -I$(INCLUDE_DIR)
+CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++14 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
 LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  :=
 LDLIBS   := -ldl -lpthread

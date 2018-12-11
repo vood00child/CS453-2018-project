@@ -78,9 +78,9 @@ You may read and inspire from existing STM libraries, but it must be **your own 
 
 1. Zip your modified copy of the `template` directory.
 
-2. Send your code for evaluation with the `submit.py` script.
+2. Send your code for evaluation with the `submit.py` script. You can specify for which step your submission is.
 ```
-usage: submit.py [-h] --uuid UUID [--host HOST] [--port PORT] zippath
+usage: submit.py [-h] --uuid UUID [--host HOST] [--port PORT] [--step STEP] zippath
 
 positional arguments:
   zippath      Path to a zip file containing your library code
@@ -88,8 +88,9 @@ positional arguments:
 optional arguments:
   -h, --help   show this help message and exit
   --uuid UUID  Secret user unique identifier
-  --host HOST  Server hostname or IPv4
+  --host HOST  Server hostname
   --port PORT  Server TCP port
+  --step STEP  Which step of the project your submission fulfills
 ```
 
 You can submit code as often as you want until the deadline.

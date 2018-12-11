@@ -208,12 +208,22 @@ socket_sendfield(client_fd, zip_data)
 
 # Read until the socket is closed
 try:
+  prev = bytes()
   while True:
     data = client_fd.recv(256)
     if len(data) <= 0:
+      # Here 'prev' should be empty or not enough data to decode 'prev' correctly: so do nothing
       break
-    sys.stdout.write(data.decode())
-    sys.stdout.flush()
+    data = prev + data
+    prev = bytes()
+    try:
+      text = data.decode()
+    except UnicodeDecodeError as err:
+      prev = data[err.start:]
+      text = data[:err.start].decode()
+    if len(text) > 0:
+      sys.stdout.write(text)
+      sys.stdout.flush()
 except ConnectionResetError:
   pass
 except KeyboardInterrupt:
