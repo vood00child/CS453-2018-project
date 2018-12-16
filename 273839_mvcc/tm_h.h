@@ -81,8 +81,8 @@ typedef struct _AVPair
   uintptr_t *Addr;
   intptr_t Val;
   int Held;
-  shared_memory_state *State; // starts at 0
-  long Ordinal;               /* local index of the entry */
+  shared_memory_state *State;
+  long Ordinal; /* local index of the entry */
 } AVPair;
 
 /* Read-set and write-set log */

@@ -201,20 +201,8 @@ static __inline__ States *MakeListStates(shared_t *shared)
 static __inline__ AVPair *ExtendListAVPair(AVPair *tail)
 {
     printf("Extend\n");
+    fflush(stdout);
     AVPair *e = (AVPair *)malloc(sizeof(*e));
-    ASSERT(e);
-    memset(e, 0, sizeof(*e));
-    tail->Next = e;
-    e->Prev = tail;
-    e->Next = NULL;
-    e->Ordinal = tail->Ordinal + 1;
-    /*e->Held    = 0; -- done by memset*/
-    return e;
-}
-
-static __inline__ Object *ExtendListObject(Object *tail)
-{
-    Object *e = (Object *)malloc(sizeof(*e));
     ASSERT(e);
     memset(e, 0, sizeof(*e));
     tail->Next = e;
@@ -384,7 +372,7 @@ static __inline__ void RecordStore(Thread *self, uintptr_t *source, uintptr_t *t
     AVPair *e = k->put;
     if (e == NULL)
     {
-        // ASSERT(0 == 1); // (means wr list overflows)
+        ASSERT(0 == 1); // (means wr list overflows)
         e = ExtendListAVPair(k->tail);
         k->end = e;
     }
@@ -507,10 +495,11 @@ static __inline__ long TxCommit(shared_t shared, Thread *self)
 
     for (AVPair *p = wr->List; p != End_wr; p = p->Next)
     {
-        if (!lock_acquire(&(*(p->State)).lock))
+        if (!lock_acquire(&(p->State)->lock))
         {
             return 0;
         }
+
         (*(p->State)).isLocked = true;
         (*(p->State)).Owner = self;
         p->Held = 1;
@@ -521,7 +510,6 @@ static __inline__ long TxCommit(shared_t shared, Thread *self)
     {
         if (!TxValidateReadOnCommit(self, p->State))
         {
-
             return 0;
         }
     }
@@ -568,6 +556,9 @@ void TxFreeThread(Thread *t)
 **/
 shared_t tm_create(size_t size, size_t align)
 {
+    printf("tm_create\n");
+    fflush(stdout);
+
     struct region *region = (struct region *)malloc(sizeof(struct region));
     if (unlikely(!region))
     {
@@ -589,6 +580,7 @@ shared_t tm_create(size_t size, size_t align)
     region->timeLock.locked = false;
 
     region->states = MakeListStates((shared_t *)region);
+
     // region->weakRef = (ListObject *)calloc(nb_objects, sizeof(ListObject));
     // for (size_t i = 0; i < nb_objects; i++)
     // {
@@ -607,6 +599,9 @@ shared_t tm_create(size_t size, size_t align)
 **/
 void tm_destroy(shared_t shared)
 {
+    printf("tm_destroy\n");
+    fflush(stdout);
+
     struct region *region = (struct region *)shared;
     free(region->start);
     // size_t nb_objects = tm_size(shared) / tm_align(shared);
@@ -685,6 +680,8 @@ bool tm_end(shared_t shared, tx_t tx)
     /* We have written nothing */
     if (t->wrSet.put == t->wrSet.List)
     {
+        // printf("should not happen\n");
+        // fflush(stdout);
         TxFreeThread(t);
         return true;
     }
@@ -711,6 +708,8 @@ bool tm_end(shared_t shared, tx_t tx)
 **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
+    // printf("tm_read\n");
+    // fflush(stdout);
     Thread *t = (Thread *)tx;
     struct region *region = (struct region *)shared;
 
@@ -795,6 +794,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 **/
 bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
+
     Thread *t = (Thread *)tx;
     struct region *region = (struct region *)shared;
 
@@ -805,12 +805,14 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
     shared_memory_state *memory_state = NULL;
     uintptr_t start_address = 0;
+
     for (States *state = region->states; state != NULL; state = state->Next)
     {
-        if (state->from <= (uintptr_t)source && state->to > (uintptr_t)source)
+        if (state->from <= (uintptr_t)target && state->to > (uintptr_t)target)
         {
             memory_state = state->memory_state;
             start_address = state->from;
+            continue;
         }
     }
 
