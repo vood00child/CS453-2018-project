@@ -279,7 +279,7 @@ public:
             for (size_t i = 0; i < nbaccounts; ++i)
                 segment.accounts[i] = init_balance;
         });
-        auto correct = transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
+        auto correct = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
             AccountSegment segment{tx, tm.get_start()};
             return segment.accounts[0] == init_balance;
         });
@@ -320,12 +320,11 @@ public:
                 Shared<size_t> counter{tx, tm.get_start()};
                 counter = init_counter;
             });
-            auto correct = transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
+            auto correct = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
                 Shared<size_t> counter{tx, tm.get_start()};
                 return counter == init_counter;
             });
             if (unlikely(!correct)) {
-                ::std::cout << "HERE!" << ::std::endl;
                 barrier.sync();
                 barrier.sync();
                 return "Violated consistency";
@@ -333,7 +332,7 @@ public:
         }
         barrier.sync();
         for (size_t i = 0; i < nbtxperwrk; ++i) {
-            auto last = transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
+            auto last = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
                 Shared<size_t> counter{tx, tm.get_start()};
                 return counter.read();
             });
@@ -352,7 +351,7 @@ public:
         }
         barrier.sync();
         if (uid == 0) {
-            auto correct = transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
+            auto correct = transactional(tm, Transaction::Mode::read_only, [&](Transaction& tx) {
                 Shared<size_t> counter{tx, tm.get_start()};
                 return counter == 0;
             });
